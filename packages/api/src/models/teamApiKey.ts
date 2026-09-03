@@ -13,7 +13,7 @@ type ObjectId = mongoose.Types.ObjectId;
 // listTeamApiKeys in controllers/team.ts), so each "service" a dev works on
 // gets its own named key and the dev is added as a member of that key —
 // they never see the team's other services' keys or the shared default key.
-export interface ITeamApiKey {
+interface ITeamApiKey {
   _id: ObjectId;
   team: ObjectId;
   name: string;
@@ -24,8 +24,6 @@ export interface ITeamApiKey {
   updatedAt: Date;
   revokedAt?: Date | null;
 }
-
-export type TeamApiKeyDocument = mongoose.HydratedDocument<ITeamApiKey>;
 
 const TeamApiKeySchema = new Schema<ITeamApiKey>(
   {

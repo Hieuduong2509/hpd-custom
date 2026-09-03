@@ -5,7 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 type ObjectId = mongoose.Types.ObjectId;
 
-export type UserRole = 'admin' | 'owner' | 'dev';
+type UserRole = 'admin' | 'owner' | 'dev';
 
 export interface IUser {
   _id: ObjectId;
