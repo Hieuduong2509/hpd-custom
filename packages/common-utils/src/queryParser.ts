@@ -1,0 +1,2213 @@
+import lucene from '@hyperdx/lucene';
+import { chunk } from 'lodash';
+import SqlString from 'sqlstring';
+
+import {
+  ColumnMeta,
+  convertCHDataTypeToJSType,
+  convertCHTypeToLuceneSearchType,
+  extractInnerCHArrayJSType,
+  JSDataType,
+} from '@/clickhouse';
+import {
+  ClickHouseVersion,
+  isClickHouseVersionAtLeast,
+  supportsDirectReadMap,
+} from '@/core/clickhouseVersion';
+import {
+  Metadata,
+  parseKeyPath,
+  SkipIndexMetadata,
+  TableConnection,
+} from '@/core/metadata';
+import {
+  parseTokenizerFromTextIndex,
+  splitAndTrimWithBracket,
+} from '@/core/utils';
+import { UseTextIndex } from '@/types';
+
+/** Max number of tokens to pass to hasAllTokens(), which supports up to 64 tokens as of ClickHouse v25.12. */
+const HAS_ALL_TOKENS_CHUNK_SIZE = 50;
+
+function encodeSpecialTokens(query: string): string {
+  return query
+    .replace(/\\\\/g, 'HDX_BACKSLASH_LITERAL')
+    .replace(/http:\/\//g, 'http_COLON_//')
+    .replace(/https:\/\//g, 'https_COLON_//')
+    .replace(/localhost:(\d{1,5})/g, 'localhost_COLON_$1')
+    .replace(/\\:/g, 'HDX_COLON');
+}
+function decodeSpecialTokens(query: string): string {
+  return query
+    .replace(/\\"/g, '"')
+    .replace(/HDX_BACKSLASH_LITERAL/g, '\\')
+    .replace(/http_COLON_\/\//g, 'http://')
+    .replace(/https_COLON_\/\//g, 'https://')
+    .replace(/localhost_COLON_(\d{1,5})/g, 'localhost:$1')
+    .replace(/HDX_COLON/g, ':');
+}
+
+export function parse(query: string): lucene.AST {
+  return lucene.parse(encodeSpecialTokens(query));
+}
+
+/** Escape the LIKE/ILIKE metacharacters `\`, `%` and `_` so a term matches literally */
+function escapeLikePattern(term: string): string {
+  return term.replace(/[\\%_]/g, '\\$&');
+}
+
+function buildMapContains(mapField: string) {
+  const path = parseKeyPath(mapField);
+  if (path.length < 2) return undefined;
+  return SqlString.format('mapContains(??, ?)', [path[0], path[1]]);
+}
+
+/** Render a column as a SQL operand, escaping it as an identifier unless it is an already-rendered Map subscript */
+function renderColumnOperand(column: string | undefined, mapKey?: string) {
+  return SqlString.raw(
+    mapKey != null ? (column ?? '') : SqlString.escapeId(column),
+  );
+}
+
+/** Strip whitespace and backtick-quoting from a ClickHouse expression for comparison */
+function normalizeChExpression(expr: string): string {
+  return expr.replace(/\s+/g, '').replace(/`/g, '');
+}
+
+const IMPLICIT_FIELD = '<implicit>';
+const RANGE_UNBOUNDED = '*';
+
+// Type guards for lucene AST types
+function isNodeTerm(node: lucene.Node | lucene.AST): node is lucene.NodeTerm {
+  return 'term' in node && node.term != null;
+}
+
+function isNodeRangedTerm(
+  node: lucene.Node | lucene.AST,
+): node is lucene.NodeRangedTerm {
+  return 'inclusive' in node && node.inclusive != null;
+}
+
+function isBinaryAST(ast: lucene.AST | lucene.Node): ast is lucene.BinaryAST {
+  return 'right' in ast && ast.right != null;
+}
+
+function hasStart(
+  ast: lucene.BinaryAST,
+): ast is lucene.BinaryAST & { start: lucene.Operator } {
+  return 'start' in ast && !!ast.start;
+}
+
+function isLeftOnlyAST(
+  ast: lucene.AST | lucene.Node,
+): ast is lucene.LeftOnlyAST {
+  return (
+    'left' in ast && ast.left != null && !('right' in ast && ast.right != null)
+  );
+}
+
+const CLICK_HOUSE_JSON_NUMBER_TYPES = [
+  'Int8',
+  'Int16',
+  'Int32',
+  'Int64',
+  'Int128',
+  'Int256',
+  'UInt8',
+  'UInt16',
+  'UInt32',
+  'UInt64',
+  'UInt128',
+  'UInt256',
+  'Float32',
+  'Float64',
+];
+
+/**
+ * Find and return the column metadata for the column in the
+ * given table with the shortest name that matches a
+ * prefix of the given dot-separated field.
+ *
+ * eg. for field 'a.b.c', check for columns 'a', 'a.b', 'a.b.c' in order.
+ **/
+async function findPrefixMatch({
+  field,
+  metadata,
+  databaseName,
+  tableName,
+  connectionId,
+}: {
+  field: string;
+  metadata: Metadata;
+  databaseName: string;
+  tableName: string;
+  connectionId: string;
+}): Promise<ColumnMeta | undefined> {
+  const fieldParts = field.split('.');
+  let fieldPrefix = '';
+
+  for (const part of fieldParts) {
+    fieldPrefix = fieldPrefix ? `${fieldPrefix}.${part}` : part;
+    const prefixMatch = await metadata.getColumn({
+      databaseName,
+      tableName,
+      column: fieldPrefix,
+      connectionId,
+    });
+
+    if (prefixMatch) {
+      return prefixMatch;
+    }
+  }
+}
+
+interface SerializerContext {
+  /** The current implicit column expression, indicating which SQL expression to use when comparing a term to the '<implicit>' field */
+  implicitColumnExpression?: string;
+  /**
+   * Fallback used when implicitColumnExpression is unset. Mirrors the one-way
+   * fallback `getEventBody` already implements for row display: an admin who
+   * sets only the Body Expression on a log source can still run bare-text
+   * Lucene search.
+   */
+  bodyExpression?: string;
+  isNegatedAndParenthesized?: boolean;
+}
+
+interface Serializer {
+  operator(op: lucene.Operator, context: SerializerContext): string;
+  eq(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ): Promise<string>;
+  isNotNull(
+    field: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ): Promise<string>;
+  gte(field: string, term: string, context: SerializerContext): Promise<string>;
+  lte(field: string, term: string, context: SerializerContext): Promise<string>;
+  lt(field: string, term: string, context: SerializerContext): Promise<string>;
+  gt(field: string, term: string, context: SerializerContext): Promise<string>;
+  fieldSearch(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    prefixWildcard: boolean,
+    suffixWildcard: boolean,
+    context: SerializerContext,
+  ): Promise<string>;
+  range(
+    field: string,
+    start: string,
+    end: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+    inclusive?: lucene.NodeRangedTerm['inclusive'],
+  ): Promise<string>;
+}
+
+class EnglishSerializer implements Serializer {
+  private metadata: Metadata;
+  private tableName: string;
+  private databaseName: string;
+  private connectionId: string;
+
+  constructor({
+    metadata,
+    databaseName,
+    tableName,
+    connectionId,
+  }: { metadata: Metadata } & CustomSchemaConfig) {
+    this.metadata = metadata;
+    this.databaseName = databaseName;
+    this.tableName = tableName;
+    this.connectionId = connectionId;
+  }
+
+  private translateField(field: string, context: SerializerContext) {
+    if (field === IMPLICIT_FIELD) {
+      return context.implicitColumnExpression ?? 'event';
+    }
+
+    return `'${field}'`;
+  }
+
+  private async getFieldType(field: string) {
+    const column = await findPrefixMatch({
+      field,
+      metadata: this.metadata,
+      databaseName: this.databaseName,
+      tableName: this.tableName,
+      connectionId: this.connectionId,
+    });
+    const fieldParts = field.split('.');
+    const fieldPostfix = fieldParts
+      .slice(column ? column.name.split('.').length : 0)
+      .join('.');
+
+    if (!column) {
+      return {
+        isArray: false,
+        type: null,
+      };
+    }
+
+    let jsType = convertCHDataTypeToJSType(column.type);
+    const isArray = jsType === JSDataType.Array;
+    if (isArray && extractInnerCHArrayJSType(column.type)) {
+      jsType = extractInnerCHArrayJSType(column.type);
+    }
+
+    return { isArray, type: jsType, fieldPostfix, column: column.name };
+  }
+
+  operator(op: lucene.Operator) {
+    switch (op) {
+      case 'NOT':
+      case 'AND NOT':
+        return 'AND NOT';
+      case 'OR NOT':
+        return 'OR NOT';
+      // @ts-expect-error TODO: Types need to be fixed upstream
+      case '&&':
+      case '<implicit>':
+      case 'AND':
+        return 'AND';
+      // @ts-expect-error TODO: Types need to be fixed upstream
+      case '||':
+      case 'OR':
+        return 'OR';
+      default:
+        throw new Error(`Unexpected operator. ${op}`);
+    }
+  }
+
+  async eq(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ) {
+    const { isArray } = await this.getFieldType(field);
+
+    return `${this.translateField(field, context)} ${
+      isArray
+        ? isNegatedField
+          ? 'does not contain'
+          : 'contains'
+        : isNegatedField
+          ? 'is not'
+          : 'is'
+    } ${term}`;
+  }
+
+  async isNotNull(
+    field: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ) {
+    const { isArray, type, fieldPostfix, column } =
+      await this.getFieldType(field);
+    const isArrayOfMaps =
+      isArray && (type === JSDataType.Map || type === JSDataType.JSON);
+
+    if (column && isArrayOfMaps && fieldPostfix) {
+      return `${this.translateField(column, context)} ${
+        isNegatedField
+          ? `does not contain an element with non-null ${fieldPostfix}`
+          : `contains an element with non-null ${fieldPostfix}`
+      }`;
+    }
+
+    return `${this.translateField(field, context)} ${
+      isNegatedField ? 'is null' : 'is not null'
+    }`;
+  }
+
+  async gte(field: string, term: string, context: SerializerContext) {
+    return `${this.translateField(field, context)} is greater than or equal to ${term}`;
+  }
+
+  async lte(field: string, term: string, context: SerializerContext) {
+    return `${this.translateField(field, context)} is less than or equal to ${term}`;
+  }
+
+  async lt(field: string, term: string, context: SerializerContext) {
+    return `${this.translateField(field, context)} is less than ${term}`;
+  }
+
+  async gt(field: string, term: string, context: SerializerContext) {
+    return `${this.translateField(field, context)} is greater than ${term}`;
+  }
+
+  async fieldSearch(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    prefixWildcard: boolean,
+    suffixWildcard: boolean,
+    context: SerializerContext,
+  ) {
+    const formattedTerm = term.trim().match(/\s/) ? `"${term}"` : term;
+
+    if (field === IMPLICIT_FIELD) {
+      const isUsingTokenSearch = !context.implicitColumnExpression; // Source's implicit column has not been overridden
+      return `${this.translateField(field, context)} ${
+        prefixWildcard && suffixWildcard
+          ? isNegatedField
+            ? 'does not contain'
+            : 'contains'
+          : prefixWildcard
+            ? isNegatedField
+              ? 'does not end with'
+              : 'ends with'
+            : suffixWildcard
+              ? isNegatedField
+                ? 'does not start with'
+                : 'starts with'
+              : isUsingTokenSearch
+                ? isNegatedField
+                  ? 'does not have whole word'
+                  : 'has whole word'
+                : isNegatedField
+                  ? 'does not contain'
+                  : 'contains'
+      } ${formattedTerm}`;
+    } else {
+      const { isArray, type, column, fieldPostfix } =
+        await this.getFieldType(field);
+      const isExactMatchType =
+        type === JSDataType.Bool || type === JSDataType.Number;
+      const isArrayOfMaps =
+        isArray && (type === JSDataType.Map || type === JSDataType.JSON);
+      const fieldToTranslate = isArrayOfMaps && column ? column : field;
+      return `${this.translateField(fieldToTranslate, context)} ${
+        isArrayOfMaps
+          ? isNegatedField
+            ? `does not contain an element with key ${fieldPostfix} and value`
+            : `contains an element with key ${fieldPostfix} and value`
+          : isArray && !isExactMatchType
+            ? isNegatedField
+              ? 'does not contain an element containing'
+              : 'contains an element containing'
+            : isNegatedField
+              ? 'does not contain'
+              : 'contains'
+      } ${formattedTerm}`;
+    }
+  }
+
+  async range(
+    field: string,
+    start: string,
+    end: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+    inclusive: lucene.NodeRangedTerm['inclusive'] = 'both',
+  ) {
+    const startBound =
+      inclusive === 'both' || inclusive === 'left'
+        ? start
+        : `${start} (exclusive)`;
+    const endBound =
+      inclusive === 'both' || inclusive === 'right'
+        ? end
+        : `${end} (exclusive)`;
+    return `${field} ${
+      isNegatedField ? 'is not' : 'is'
+    } between ${startBound} and ${endBound}`;
+  }
+}
+
+export abstract class SQLSerializer implements Serializer {
+  protected NOT_FOUND_QUERY = '(1 = 0)';
+
+  abstract getColumnForField(
+    field: string,
+    context: SerializerContext,
+  ): Promise<{
+    column?: string;
+    columnJSON?: { string: string; number: string };
+    propertyType?: JSDataType;
+    isArray?: boolean;
+    found: boolean;
+    mapKey?: string;
+    mapKeyIndexExpression?: string;
+    arrayMapKeyExpression?: string;
+    kvItemsExpression?: KvIndexInfo & { mapKey: string };
+  }>;
+
+  operator(op: lucene.Operator) {
+    switch (op) {
+      case 'NOT':
+      case 'AND NOT':
+        return 'AND NOT';
+      case 'OR NOT':
+        return 'OR NOT';
+      // @ts-expect-error TODO: Types need to be fixed upstream
+      case '&&':
+      case '<implicit>':
+      case 'AND':
+        return 'AND';
+      // @ts-expect-error TODO: Types need to be fixed upstream
+      case '||':
+      case 'OR':
+        return 'OR';
+      default:
+        throw new Error(`Unexpected operator. ${op}`);
+    }
+  }
+
+  // Only for exact string matches
+  async eq(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKey,
+      mapKeyIndexExpression,
+      arrayMapKeyExpression,
+      kvItemsExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+
+    if (column && isArray) {
+      return renderArrayFieldExpression({
+        column,
+        mapKey: arrayMapKeyExpression,
+        term,
+        propertyType,
+        isNegatedField,
+        exactMatch: true,
+      });
+    }
+
+    // KV items index optimization: use has(KvItemsColumn, concat('key','<sep>','value'))
+    // instead of Map['key'] = 'value' when a text(tokenizer=array) index exists.
+    // For empty-term equality we also match absent keys (Map subscript returns default ''),
+    // so we emit: has(arr, 'key<sep>') OR NOT mapContains(Map, 'key')
+    if (kvItemsExpression && propertyType === JSDataType.String) {
+      const hasExpr = SqlString.format(`has(??, concat(?, ?, ?))`, [
+        kvItemsExpression.columnName,
+        kvItemsExpression.mapKey,
+        kvItemsExpression.separator,
+        term,
+      ]);
+      if (term === '') {
+        const notContains = SqlString.format(`NOT mapContains(??, ?)`, [
+          kvItemsExpression.mapColumn,
+          kvItemsExpression.mapKey,
+        ]);
+        return isNegatedField
+          ? `(NOT ${hasExpr} AND ${SqlString.format(`mapContains(??, ?)`, [kvItemsExpression.mapColumn, kvItemsExpression.mapKey])})`
+          : `(${hasExpr} OR ${notContains})`;
+      }
+      return `(${isNegatedField ? 'NOT ' : ''}${hasExpr})`;
+    }
+
+    const expressionPostfix =
+      mapKeyIndexExpression && !isNegatedField
+        ? ` AND ${mapKeyIndexExpression}`
+        : '';
+    if (propertyType === JSDataType.Bool) {
+      // numeric and boolean fields must be equality matched
+      const normTerm = `${term}`.trim().toLowerCase();
+      return SqlString.format(
+        `(? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+        [
+          renderColumnOperand(column, mapKey),
+          normTerm === 'true'
+            ? 1
+            : normTerm === 'false'
+              ? 0
+              : parseInt(normTerm),
+        ],
+      );
+    } else if (propertyType === JSDataType.Number) {
+      return SqlString.format(
+        `(${column} ${isNegatedField ? '!' : ''}= CAST(?, 'Float64')${expressionPostfix})`,
+        [term],
+      );
+    } else if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.string} ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+        [term],
+      );
+    }
+    return SqlString.format(
+      `(${column} ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+      [term],
+    );
+  }
+
+  async isNotNull(
+    field: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+  ) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      mapKeyIndexExpression,
+      isArray,
+      arrayMapKeyExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    const expressionPostfix =
+      mapKeyIndexExpression && !isNegatedField
+        ? ` AND ${mapKeyIndexExpression}`
+        : '';
+
+    if (
+      column &&
+      isArray &&
+      (propertyType === JSDataType.Map || propertyType === JSDataType.JSON) &&
+      arrayMapKeyExpression
+    ) {
+      const fieldAccess =
+        propertyType === JSDataType.Map
+          ? SqlString.format('el[?]', [arrayMapKeyExpression])
+          : SqlString.format('el.??', [arrayMapKeyExpression]);
+      return SqlString.format(
+        `${isNegatedField ? 'NOT ' : ''}arrayExists(el -> notEmpty(toString(${fieldAccess})) = 1, ?)`,
+        [SqlString.raw(column)],
+      );
+    }
+
+    if (propertyType === JSDataType.JSON && !isArray) {
+      return `notEmpty(${columnJSON?.string}) ${isNegatedField ? '!' : ''}= 1${expressionPostfix}`;
+    }
+    return `notEmpty(${column}) ${isNegatedField ? '!' : ''}= 1${expressionPostfix}`;
+  }
+
+  async gte(field: string, term: string, context: SerializerContext) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKeyIndexExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    if (isArray) {
+      throw new Error('>= comparison is not supported for Array-type fields');
+    }
+    const expressionPostfix = mapKeyIndexExpression
+      ? ` AND ${mapKeyIndexExpression}`
+      : '';
+    if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.number} >= ?${expressionPostfix})`,
+        [term],
+      );
+    }
+    return SqlString.format(`(${column} >= ?${expressionPostfix})`, [term]);
+  }
+
+  async lte(field: string, term: string, context: SerializerContext) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKeyIndexExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    if (isArray) {
+      throw new Error('<= comparison is not supported for Array-type fields');
+    }
+    const expressionPostfix = mapKeyIndexExpression
+      ? ` AND ${mapKeyIndexExpression}`
+      : '';
+    if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.number} <= ?${expressionPostfix})`,
+        [term],
+      );
+    }
+    return SqlString.format(`(${column} <= ?${expressionPostfix})`, [term]);
+  }
+
+  async lt(field: string, term: string, context: SerializerContext) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKeyIndexExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    if (isArray) {
+      throw new Error('< comparison is not supported for Array-type fields');
+    }
+    const expressionPostfix = mapKeyIndexExpression
+      ? ` AND ${mapKeyIndexExpression}`
+      : '';
+    if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.number} < ?${expressionPostfix})`,
+        [term],
+      );
+    }
+    return SqlString.format(`(${column} < ?${expressionPostfix})`, [term]);
+  }
+
+  async gt(field: string, term: string, context: SerializerContext) {
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKeyIndexExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    if (isArray) {
+      throw new Error('> comparison is not supported for Array-type fields');
+    }
+    const expressionPostfix = mapKeyIndexExpression
+      ? ` AND ${mapKeyIndexExpression}`
+      : '';
+    if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.number} > ?${expressionPostfix})`,
+        [term],
+      );
+    }
+    return SqlString.format(`(${column} > ?${expressionPostfix})`, [term]);
+  }
+
+  // TODO: Not sure if SQL really needs this or if it'll coerce itself
+  private attemptToParseNumber(term: string): string | number {
+    const number = Number(term);
+    if (Number.isNaN(number)) {
+      return term;
+    }
+    return number;
+  }
+
+  // Ref: https://clickhouse.com/codebrowser/ClickHouse/src/Functions/HasTokenImpl.h.html#_ZN2DB12HasTokenImpl16isTokenSeparatorEDu
+  // Split by anything that's ascii 0-128, that's not a letter or a number
+  protected tokenizeTerm(term: string): string[] {
+    return term.split(/[ -/:-@[-`{-~\t\n\r]+/).filter(t => t.length > 0);
+  }
+
+  protected termHasSeparators(term: string): boolean {
+    return term.match(/[ -/:-@[-`{-~\t\n\r]+/) != null;
+  }
+
+  abstract fieldSearch(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    prefixWildcard: boolean,
+    suffixWildcard: boolean,
+    context: SerializerContext,
+  ): Promise<string>;
+
+  async range(
+    field: string,
+    start: string,
+    end: string,
+    isNegatedField: boolean,
+    context: SerializerContext,
+    inclusive: lucene.NodeRangedTerm['inclusive'] = 'both',
+  ) {
+    const { column, found, mapKeyIndexExpression, isArray } =
+      await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    if (isArray) {
+      throw new Error(
+        'range comparison is not supported for Array-type fields',
+      );
+    }
+    const expressionPostfix =
+      mapKeyIndexExpression && !isNegatedField
+        ? ` AND ${mapKeyIndexExpression}`
+        : '';
+
+    const isStartUnbounded = start === RANGE_UNBOUNDED;
+    const isEndUnbounded = end === RANGE_UNBOUNDED;
+    if (isStartUnbounded && isEndUnbounded) {
+      return this.isNotNull(field, isNegatedField, context);
+    }
+    if (!isStartUnbounded && !isEndUnbounded && inclusive === 'both') {
+      return SqlString.format(
+        `(${column} ${isNegatedField ? 'NOT ' : ''}BETWEEN ? AND ?${expressionPostfix})`,
+        [this.attemptToParseNumber(start), this.attemptToParseNumber(end)],
+      );
+    }
+
+    const bounds: string[] = [];
+    if (!isStartUnbounded) {
+      const operator =
+        inclusive === 'both' || inclusive === 'left' ? '>=' : '>';
+      bounds.push(
+        SqlString.format(`${column} ${operator} ?`, [
+          this.attemptToParseNumber(start),
+        ]),
+      );
+    }
+    if (!isEndUnbounded) {
+      const operator =
+        inclusive === 'both' || inclusive === 'right' ? '<=' : '<';
+      bounds.push(
+        SqlString.format(`${column} ${operator} ?`, [
+          this.attemptToParseNumber(end),
+        ]),
+      );
+    }
+    return isNegatedField
+      ? `(NOT (${bounds.join(' AND ')})${expressionPostfix})`
+      : `(${bounds.join(' AND ')}${expressionPostfix})`;
+  }
+}
+
+type CustomSchemaSQLColumnExpression = {
+  found: boolean;
+  columnType: string;
+  columnExpression: string;
+  columnExpressionJSON?: {
+    string: string;
+    number: string;
+  };
+  mapKeyIndexExpression?: string;
+  arrayMapKeyExpression?: string;
+  mapKey?: string;
+  /** When a KV items index exists for a Map column, carries the info needed for the has() optimization */
+  textIndexInfo?: TextIndexInfo;
+};
+
+export type CustomSchemaConfig = {
+  databaseName: string;
+  implicitColumnExpression?: string;
+  /**
+   * Body expression to fall back to when `implicitColumnExpression` is unset
+   * but the source has a body column configured. Populated only by log
+   * sources; trace sources do not auto-fall-back from `spanNameExpression`.
+   */
+  bodyExpression?: string;
+  tableName: string;
+  connectionId: string;
+  /**
+   * Source-level override for whether to use a ClickHouse text index when
+   * rendering implicit-field lucene matches. When `undefined` (or
+   * `UseTextIndex.Auto`), the renderer detects a covering index from table
+   * metadata; otherwise, it forces the chosen behavior.
+   */
+  useTextIndexForImplicitColumn?: UseTextIndex;
+};
+
+function renderArrayFieldExpression({
+  column,
+  mapKey,
+  term,
+  isNegatedField,
+  propertyType,
+  exactMatch,
+}: {
+  column: string;
+  mapKey?: string;
+  term: string;
+  isNegatedField: boolean;
+  propertyType?: JSDataType;
+  exactMatch: boolean;
+}) {
+  const prefix = isNegatedField ? 'NOT ' : '';
+
+  if (propertyType === JSDataType.Number) {
+    return SqlString.format(`${prefix}has(?, CAST(?, 'Float64'))`, [
+      SqlString.raw(column),
+      term,
+    ]);
+  }
+
+  if (propertyType === JSDataType.Bool) {
+    const normTerm = `${term}`.trim().toLowerCase();
+    const comparisonValue =
+      normTerm === 'true' ? 1 : normTerm === 'false' ? 0 : term;
+    return SqlString.format(`${prefix}has(?, ?)`, [
+      SqlString.raw(column),
+      comparisonValue,
+    ]);
+  }
+
+  if (propertyType === JSDataType.Map) {
+    if (!mapKey) {
+      throw new Error(
+        `Map key expression is required for searching column ${column}. Try '${column}.key:value'`,
+      );
+    }
+    return exactMatch
+      ? SqlString.format(`${prefix}arrayExists(el -> el[?] = ?, ?)`, [
+          mapKey,
+          term,
+          SqlString.raw(column),
+        ])
+      : SqlString.format(`${prefix}arrayExists(el -> el[?] ILIKE ?, ?)`, [
+          mapKey,
+          `%${escapeLikePattern(term)}%`,
+          SqlString.raw(column),
+        ]);
+  }
+
+  if (propertyType === JSDataType.JSON) {
+    if (!mapKey) {
+      throw new Error(
+        `Map key expression is required for searching column ${column}. Try '${column}.key:value'`,
+      );
+    }
+    return exactMatch
+      ? SqlString.format(`${prefix}arrayExists(el -> toString(el.??) = ?, ?)`, [
+          mapKey,
+          term,
+          SqlString.raw(column),
+        ])
+      : SqlString.format(
+          `${prefix}arrayExists(el -> toString(el.??) ILIKE ?, ?)`,
+          [mapKey, `%${escapeLikePattern(term)}%`, SqlString.raw(column)],
+        );
+  }
+
+  const stringifiedElement =
+    propertyType === JSDataType.String
+      ? 'el'
+      : SqlString.format('toString(el)', [SqlString.raw(column)]);
+
+  return exactMatch && propertyType === JSDataType.String
+    ? SqlString.format(`${prefix}has(?, ?)`, [SqlString.raw(column), term])
+    : exactMatch
+      ? SqlString.format(
+          `${prefix}arrayExists(el -> ${stringifiedElement} = ?, ?)`,
+          [term, SqlString.raw(column)],
+        )
+      : SqlString.format(
+          `${prefix}arrayExists(el -> ${stringifiedElement} ILIKE ?, ?)`,
+          [`%${escapeLikePattern(term)}%`, SqlString.raw(column)],
+        );
+}
+
+/** Describes a KV items column and its concat separator */
+export type KvIndexInfo = {
+  columnName: string;
+  indexName: string;
+  separator: string;
+  /**
+   * Whether the connected ClickHouse server supports `hasAny(items, array(...))`
+   * over the KV items column. `hasAny` on the direct_read map items column only
+   * ships in mainline 26.5+; earlier backport branches (26.2/26.3/26.4) support
+   * `has(...)` but not `hasAny(...)` and must fall back to a chain of `has()`
+   * calls combined with `OR`.
+   */
+  useHasAny: boolean;
+  mapColumn: string;
+};
+export type KeyIndexInfo = {
+  indexName: string;
+  mapColumn: string;
+};
+export type TextIndexInfo = { kv?: KvIndexInfo; key?: KeyIndexInfo };
+
+/** Map from map column name to its text index info */
+export type TextIndexInfoLookup = Map<string, TextIndexInfo>;
+
+/**
+ * Tokenizes a ClickHouse expression into meaningful tokens (identifiers, parens,
+ * commas, arrows, quoted strings, operators). Whitespace is skipped.
+ * Returns null if the expression contains unrecognized characters.
+ */
+function tokenizeExpression(expr: string): string[] | null {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < expr.length) {
+    // Skip whitespace
+    if (/\s/.test(expr[i])) {
+      i++;
+      continue;
+    }
+    // Arrow operator ->
+    if (expr[i] === '-' && expr[i + 1] === '>') {
+      tokens.push('->');
+      i += 2;
+      continue;
+    }
+    // Cast operator ::
+    if (expr[i] === ':' && expr[i + 1] === ':') {
+      tokens.push('::');
+      i += 2;
+      continue;
+    }
+    // Single-char tokens
+    if ('(),.'.includes(expr[i])) {
+      tokens.push(expr[i]);
+      i++;
+      continue;
+    }
+    // Quoted string (single or double)
+    if (expr[i] === "'" || expr[i] === '"') {
+      const quote = expr[i];
+      let str = '';
+      i++; // skip opening quote
+      while (i < expr.length && expr[i] !== quote) {
+        if (expr[i] === '\\') {
+          str += expr[i + 1] ?? '';
+          i += 2;
+        } else {
+          str += expr[i];
+          i++;
+        }
+      }
+      i++; // skip closing quote
+      tokens.push(`'${str}'`); // normalize to single-quote wrapper
+      continue;
+    }
+    // Identifier or keyword (word chars)
+    if (/\w/.test(expr[i])) {
+      let ident = '';
+      while (i < expr.length && /\w/.test(expr[i])) {
+        ident += expr[i];
+        i++;
+      }
+      tokens.push(ident);
+      continue;
+    }
+    // Unknown character — return null to signal unparseable expression
+    return null;
+  }
+  return tokens;
+}
+
+/**
+ * Helper: parses the common arrayMap lambda prefix and concat body, returning the
+ * lambda variable name, separator, and remaining token position.
+ * Handles both parenthesized `(x) ->` and bare `x ->` lambda parameter forms.
+ */
+function parseArrayMapConcatPrefix(
+  tokens: string[],
+): { lambdaVar: string; separator: string; pos: number } | undefined {
+  let pos = 0;
+  const expect = (expected: string): boolean => {
+    if (pos >= tokens.length || tokens[pos] !== expected) return false;
+    pos++;
+    return true;
+  };
+  const read = (): string | undefined => tokens[pos++];
+
+  if (!expect('arrayMap') || !expect('(')) return undefined;
+
+  // Lambda param: either (x) -> or x ->
+  let lambdaVar: string | undefined;
+  if (tokens[pos] === '(') {
+    pos++; // skip (
+    lambdaVar = read();
+    if (!lambdaVar || !expect(')')) return undefined;
+  } else {
+    lambdaVar = read();
+    if (!lambdaVar) return undefined;
+  }
+  if (!expect('->')) return undefined;
+
+  // concat(lambdaVar.1, '<sep>', lambdaVar.2)
+  if (!expect('concat') || !expect('(')) return undefined;
+  if (!expect(lambdaVar) || !expect('.') || !expect('1') || !expect(','))
+    return undefined;
+
+  const sepToken = read();
+  if (!sepToken || !sepToken.startsWith("'") || !expect(',')) return undefined;
+  const separator = sepToken.slice(1, -1);
+
+  if (
+    !expect(lambdaVar) ||
+    !expect('.') ||
+    !expect('2') ||
+    !expect(')') ||
+    !expect(',')
+  )
+    return undefined;
+
+  return { lambdaVar, separator, pos };
+}
+
+/**
+ * Parses a KV items column's default_expression to extract the source map column name
+ * and the constant separator string used in the concat.
+ * Matches the inline-cast form:
+ *   arrayMap((arr) -> concat(arr.1, '=', arr.2), X::Array(Tuple(String, String)))
+ * Also supports bare lambda param: arrayMap(x -> concat(...), ...)
+ * Returns { mapColumn, separator } if the expression matches, otherwise undefined.
+ */
+export function parseKvItemsExpression(
+  defaultExpression: string,
+): { mapColumn: string; separator: string } | undefined {
+  const tokens = tokenizeExpression(defaultExpression);
+  if (!tokens) return undefined;
+
+  const prefix = parseArrayMapConcatPrefix(tokens);
+  if (!prefix) return undefined;
+
+  let pos = prefix.pos;
+  const expect = (expected: string): boolean => {
+    if (pos >= tokens.length || tokens[pos] !== expected) return false;
+    pos++;
+    return true;
+  };
+  const read = (): string | undefined => tokens[pos++];
+
+  // X::Array(Tuple(String, String))
+  const mapColumn = read();
+  if (!mapColumn) return undefined;
+  if (
+    !expect('::') ||
+    !expect('Array') ||
+    !expect('(') ||
+    !expect('Tuple') ||
+    !expect('(') ||
+    !expect('String') ||
+    !expect(',') ||
+    !expect('String') ||
+    !expect(')') ||
+    !expect(')') ||
+    !expect(')')
+  )
+    return undefined;
+
+  if (pos !== tokens.length) return undefined;
+
+  return { mapColumn, separator: prefix.separator };
+}
+
+/**
+ * Parses a KV items column's default_expression using the CAST function form:
+ *   arrayMap((arr) -> concat(arr.1, '=', arr.2), CAST(X, 'Array(Tuple(String, String))'))
+ * Also supports bare lambda param: arrayMap(x -> concat(...), ...)
+ * Returns { mapColumn, separator } if the expression matches, otherwise undefined.
+ */
+export function parseKvItemsCastExpression(
+  defaultExpression: string,
+): { mapColumn: string; separator: string } | undefined {
+  const tokens = tokenizeExpression(defaultExpression);
+  if (!tokens) return undefined;
+
+  const prefix = parseArrayMapConcatPrefix(tokens);
+  if (!prefix) return undefined;
+
+  let pos = prefix.pos;
+  const expect = (expected: string): boolean => {
+    if (pos >= tokens.length || tokens[pos] !== expected) return false;
+    pos++;
+    return true;
+  };
+  const read = (): string | undefined => tokens[pos++];
+
+  // CAST(X, 'Array(Tuple(String, String))')
+  if (!expect('CAST') || !expect('(')) return undefined;
+  const mapColumn = read();
+  if (!mapColumn || !expect(',')) return undefined;
+
+  // The type argument is a quoted string like 'Array(Tuple(String, String))'
+  const typeToken = read();
+  if (!typeToken || !typeToken.startsWith("'")) return undefined;
+  const typeStr = typeToken.slice(1, -1); // strip quotes
+  const normalizedType = typeStr.replace(/\s+/g, '');
+  if (normalizedType !== 'Array(Tuple(String,String))') return undefined;
+
+  if (!expect(')') || !expect(')')) return undefined;
+
+  if (pos !== tokens.length) return undefined;
+
+  return { mapColumn, separator: prefix.separator };
+}
+
+// To add another known KV items parsing strategy, simply define another function with the same signature and add the strategy to this array
+const KV_ITEMS_STRATEGIES = [
+  parseKvItemsExpression,
+  parseKvItemsCastExpression,
+] as const;
+
+export function skipIndexMatches(
+  idx: SkipIndexMetadata,
+  expectedType:
+    | 'text'
+    | 'bloom_filter'
+    | 'minmax'
+    | 'tokenbf_v1'
+    | 'set'
+    | 'ngrambf_v1',
+  options?: {
+    tokenizer?: string;
+  },
+): boolean {
+  if (idx.type !== expectedType) return false;
+  if (expectedType === 'text' && options?.tokenizer) {
+    // ClickHouse's system.data_skipping_indices.type_full can render the
+    // tokenizer as either `tokenizer=array` or `tokenizer='array'` depending on
+    // server version. Delegate to the shared parser, which strips quotes and
+    // handles whitespace, instead of matching a single literal shape.
+    const parsed = parseTokenizerFromTextIndex(idx);
+    if (parsed?.type !== options.tokenizer) return false;
+  }
+  return true;
+}
+
+function populateValidKvTextIndices(
+  serverVersion: ClickHouseVersion | undefined,
+  columns: ColumnMeta[],
+  skipIndices: SkipIndexMetadata[],
+  isCloud: boolean,
+  lookup: TextIndexInfoLookup,
+) {
+  const isDirectReadSupported = supportsDirectReadMap(serverVersion, isCloud);
+  const useHasAny = isClickHouseVersionAtLeast(serverVersion, [26, 5, 0, 0]);
+  const candidates = columns.filter(
+    c =>
+      ((isDirectReadSupported && c.default_type === 'ALIAS') ||
+        c.default_type === 'MATERIALIZED') &&
+      c.default_expression,
+  );
+  for (const candidate of candidates) {
+    let parsed: { mapColumn: string; separator: string } | undefined;
+    for (const strategy of KV_ITEMS_STRATEGIES) {
+      parsed = strategy(candidate.default_expression);
+      if (parsed) break;
+    }
+    if (!parsed) continue;
+
+    const candidateName = normalizeChExpression(candidate.name);
+    const candidateExpr = normalizeChExpression(candidate.default_expression);
+
+    const validIndex = skipIndices.find(idx => {
+      if (!skipIndexMatches(idx, 'text', { tokenizer: 'array' })) return false;
+      const tokenizer = parseTokenizerFromTextIndex(idx);
+      if (tokenizer?.type !== 'array') return false;
+      const idxExpr = normalizeChExpression(idx.expression);
+      return idxExpr === candidateName || idxExpr === candidateExpr;
+    });
+
+    if (validIndex) {
+      let entry = lookup.get(parsed.mapColumn);
+      if (!entry) {
+        entry = {};
+        lookup.set(parsed.mapColumn, entry);
+      }
+      entry.kv = {
+        columnName: candidate.name,
+        indexName: validIndex.name,
+        separator: parsed.separator,
+        useHasAny,
+        mapColumn: parsed.mapColumn,
+      };
+    }
+  }
+}
+
+function populateValidKeyTextIndices(
+  _serverVersion: ClickHouseVersion | undefined,
+  columns: ColumnMeta[],
+  skipIndices: SkipIndexMetadata[],
+  _isCloud: boolean,
+  lookup: TextIndexInfoLookup,
+) {
+  const mapKeyIndexStartString = 'mapKeys(';
+  const candidates = skipIndices.filter(
+    idx =>
+      idx.expression.startsWith(mapKeyIndexStartString) &&
+      skipIndexMatches(idx, 'text', { tokenizer: 'array' }),
+  );
+  for (const candidate of candidates) {
+    const parsedMapColumn = candidate.expression.slice(
+      mapKeyIndexStartString.length,
+      -1,
+    );
+
+    const validColumn = columns.find(
+      col =>
+        col.name === parsedMapColumn &&
+        col.type === 'Map(LowCardinality(String), String)',
+    );
+
+    if (validColumn) {
+      let entry = lookup.get(parsedMapColumn);
+      if (!entry) {
+        entry = {};
+        lookup.set(parsedMapColumn, entry);
+      }
+      entry.key = {
+        indexName: candidate.name,
+        mapColumn: validColumn.name,
+      };
+    }
+  }
+}
+
+/**
+ * Builds a lookup from map column name to KV items column name.
+ * A KV items column is an ALIAS/MATERIALIZED column whose expression is
+ * arrayMap((k,v)->concat(k,'=',v), mapKeys(X), mapValues(X)) and which has
+ * a text(tokenizer=array) skip index.
+ *
+ * The version gate (`supportsDirectReadMap`) only applies to ALIAS items
+ * columns: ALIAS columns are computed at query time, so `has(items, ...)`
+ * against an ALIAS only realizes its speedup when the server can perform a
+ * direct_read against the underlying Map's tuple storage. MATERIALIZED items
+ * columns are physically stored on disk, so `has()` reads them directly and
+ * is fast on any ClickHouse version that supports the text index itself.
+ *
+ * Returns an empty Map on any failure; never throws.
+ */
+export async function buildTextIndexInfoLookup({
+  metadata,
+  databaseName,
+  tableName,
+  connectionId,
+}: {
+  metadata: Metadata;
+  databaseName: string;
+  tableName: string;
+  connectionId: string;
+}): Promise<TextIndexInfoLookup> {
+  const lookup: TextIndexInfoLookup = new Map();
+  try {
+    const [serverVersion, columns, skipIndices, isCloud] = await Promise.all([
+      metadata.getServerVersion({ connectionId }),
+      metadata.getColumns({ databaseName, tableName, connectionId }),
+      metadata
+        .getSkipIndices({ databaseName, tableName, connectionId })
+        .catch(() => [] as SkipIndexMetadata[]),
+      metadata.isClickHouseCloud({ connectionId }).catch(() => false),
+    ]);
+
+    populateValidKvTextIndices(
+      serverVersion,
+      columns,
+      skipIndices,
+      isCloud,
+      lookup,
+    );
+    populateValidKeyTextIndices(
+      serverVersion,
+      columns,
+      skipIndices,
+      isCloud,
+      lookup,
+    );
+    return lookup;
+  } catch (error) {
+    console.warn('Error building KV items lookup:', error);
+  }
+  return lookup;
+}
+
+export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
+  private metadata: Metadata;
+  private tableName: string;
+  private databaseName: string;
+  private implicitColumnExpression?: string;
+  private bodyExpression?: string;
+  private connectionId: string;
+  private useTextIndexForImplicitColumn: UseTextIndex;
+  private skipIndicesPromise?: Promise<SkipIndexMetadata[]>;
+  private enableTextIndexPromise?: Promise<boolean>;
+  private textIndexInfoLookupPromise?: Promise<TextIndexInfoLookup>;
+
+  constructor({
+    metadata,
+    databaseName,
+    tableName,
+    connectionId,
+    implicitColumnExpression,
+    bodyExpression,
+    useTextIndexForImplicitColumn,
+  }: { metadata: Metadata } & CustomSchemaConfig) {
+    super();
+    this.metadata = metadata;
+    this.databaseName = databaseName;
+    this.tableName = tableName;
+    this.implicitColumnExpression = implicitColumnExpression;
+    this.bodyExpression = bodyExpression;
+    this.connectionId = connectionId;
+    this.useTextIndexForImplicitColumn =
+      useTextIndexForImplicitColumn ?? UseTextIndex.Auto;
+
+    // Pre-fetch skip indices for potential bloom filter optimization
+    this.skipIndicesPromise = this.metadata
+      .getSkipIndices({
+        databaseName,
+        tableName,
+        connectionId,
+      })
+      .catch(error => {
+        console.error('Error fetching skip indices:', error);
+        return [];
+      });
+
+    // Pre-fetch value of the enable_full_text_index setting
+    this.enableTextIndexPromise = this.metadata
+      .getSetting({
+        settingName: 'enable_full_text_index',
+        connectionId,
+      })
+      .then(value => value === '1')
+      .catch(error => {
+        console.warn('Error fetching enable_full_text_index setting:', error);
+        return false;
+      });
+
+    this.textIndexInfoLookupPromise = this.buildTextIndexInfoLookup();
+  }
+
+  private buildTextIndexInfoLookup(): Promise<TextIndexInfoLookup> {
+    return buildTextIndexInfoLookup({
+      metadata: this.metadata,
+      databaseName: this.databaseName,
+      tableName: this.tableName,
+      connectionId: this.connectionId,
+    });
+  }
+
+  /**
+   * Override fieldSearch to support bloom_filter tokens() indices optimization.
+   * Falls back to base class hasToken behavior when no suitable bloom_filter index is found.
+   */
+  async fieldSearch(
+    field: string,
+    term: string,
+    isNegatedField: boolean,
+    prefixWildcard: boolean,
+    suffixWildcard: boolean,
+    context: SerializerContext,
+  ) {
+    const isImplicitField = field === IMPLICIT_FIELD;
+    const {
+      column,
+      columnJSON,
+      found,
+      propertyType,
+      isArray,
+      mapKey,
+      mapKeyIndexExpression,
+      arrayMapKeyExpression,
+    } = await this.getColumnForField(field, context);
+    if (!found) {
+      return this.NOT_FOUND_QUERY;
+    }
+    const expressionPostfix =
+      mapKeyIndexExpression &&
+      !isNegatedField &&
+      (!isImplicitField || !context.isNegatedAndParenthesized)
+        ? ` AND ${mapKeyIndexExpression}`
+        : '';
+
+    if (isArray) {
+      return renderArrayFieldExpression({
+        column,
+        mapKey: arrayMapKeyExpression,
+        term,
+        propertyType,
+        isNegatedField,
+        exactMatch: false,
+      });
+    }
+
+    if (propertyType === JSDataType.Bool) {
+      const normTerm = `${term}`.trim().toLowerCase();
+      return SqlString.format(
+        `(? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+        [
+          renderColumnOperand(column, mapKey),
+          normTerm === 'true'
+            ? 1
+            : normTerm === 'false'
+              ? 0
+              : parseInt(normTerm),
+        ],
+      );
+    } else if (propertyType === JSDataType.Number) {
+      return SqlString.format(
+        `(? ${isNegatedField ? '!' : ''}= CAST(?, 'Float64')${expressionPostfix})`,
+        [renderColumnOperand(column, mapKey), term],
+      );
+    } else if (propertyType === JSDataType.JSON) {
+      return SqlString.format(
+        `(${columnJSON?.string} ${isNegatedField ? 'NOT ' : ''}ILIKE ?${expressionPostfix})`,
+        [`%${escapeLikePattern(term)}%`],
+      );
+    }
+
+    // If the term is empty, return a no-op that always evaluates to true
+    if (term.length === 0) {
+      return '(1=1)';
+    }
+
+    if (isImplicitField) {
+      // Token-bloom-filter and tokens()-index optimizations key on the
+      // source's column. A per-context override (of either implicit or body)
+      // means we're searching a different expression, so skip the index
+      // optimization.
+      const shouldUseTokenBf =
+        !context.implicitColumnExpression && !context.bodyExpression;
+
+      if (prefixWildcard || suffixWildcard) {
+        return SqlString.format(
+          `(lower(?) ${isNegatedField ? 'NOT ' : ''}LIKE lower(?))`,
+          [
+            SqlString.raw(column),
+            `${prefixWildcard ? '%' : ''}${escapeLikePattern(term)}${
+              suffixWildcard ? '%' : ''
+            }`,
+          ],
+        );
+      } else if (shouldUseTokenBf) {
+        // Source preference for the text index:
+        //   - auto (default): detect a covering text index from skip-index metadata
+        //   - enabled: force hasAllTokens(), even if no text index is detected
+        //   - disabled: skip the text-index branch entirely
+        let useHasAllTokens = false;
+        let textIndexHasLower = false;
+        if (this.useTextIndexForImplicitColumn === UseTextIndex.Enabled) {
+          useHasAllTokens = true;
+          const textIndexResult = await this.findTextIndex(column);
+          if (textIndexResult) {
+            textIndexHasLower = textIndexResult.indexHasLower;
+          }
+        } else if (this.useTextIndexForImplicitColumn === UseTextIndex.Auto) {
+          // Note: We check that enable_full_text_index = 1, otherwise hasAllTokens() errors
+          const isTextIndexEnabled = await this.enableTextIndexPromise;
+          const textIndexResult = isTextIndexEnabled
+            ? await this.findTextIndex(column)
+            : undefined;
+
+          if (textIndexResult) {
+            const tokenizer = parseTokenizerFromTextIndex(
+              textIndexResult.index,
+            );
+            // HDX-3259: Support other tokenizers by overriding tokenizeTerm, termHasSeparators, and batching logic
+            if (tokenizer?.type === 'splitByNonAlpha') {
+              useHasAllTokens = true;
+              textIndexHasLower = textIndexResult.indexHasLower;
+            }
+          }
+        }
+
+        if (useHasAllTokens) {
+          const tokens = this.tokenizeTerm(term);
+          const hasSeparators = this.termHasSeparators(term);
+
+          // When the text index is on lower(column), we must pass lower(column)
+          // as the first argument and wrap the tokens in lower() to match.
+          const hasAllTokensColumn = textIndexHasLower
+            ? `lower(${column})`
+            : column;
+
+          // Batch tokens to avoid exceeding hasAllTokens limit (64)
+          const tokenBatches = chunk(tokens, HAS_ALL_TOKENS_CHUNK_SIZE);
+          const hasAllTokensExpressions = tokenBatches.map(batch =>
+            textIndexHasLower
+              ? SqlString.format(`hasAllTokens(?, lower(?))`, [
+                  SqlString.raw(hasAllTokensColumn),
+                  batch.join(' '),
+                ])
+              : SqlString.format(`hasAllTokens(?, ?)`, [
+                  SqlString.raw(hasAllTokensColumn),
+                  batch.join(' '),
+                ]),
+          );
+
+          if (hasSeparators || tokenBatches.length > 1) {
+            // Multi-token, or term containing token separators: hasAllTokens(..., 'foo bar') AND lower(...) LIKE '%foo bar%'
+            return `(${isNegatedField ? 'NOT (' : ''}${[
+              ...hasAllTokensExpressions,
+              SqlString.format(`(lower(?) LIKE lower(?))`, [
+                SqlString.raw(column),
+                `%${escapeLikePattern(term)}%`,
+              ]),
+            ].join(' AND ')}${isNegatedField ? ')' : ''})`;
+          } else {
+            // Single token, without token separators: hasAllTokens(..., 'term')
+            return `(${isNegatedField ? 'NOT ' : ''}${hasAllTokensExpressions.join(' AND ')})`;
+          }
+        }
+
+        // Check for bloom_filter tokens() index first
+        const hasSeparators = this.termHasSeparators(term);
+        const bloomIndex = await this.findBloomFilterTokensIndex(column);
+
+        if (bloomIndex.found) {
+          const indexHasLower = this.isLowerExpression(
+            bloomIndex.indexExpression,
+          );
+          const termTokensExpression = indexHasLower
+            ? SqlString.format('tokens(lower(?))', [term])
+            : SqlString.format('tokens(?)', [term]);
+
+          // Use hasAll with tokens() - more efficient than hasToken
+          // Note: tokens('foo bar') automatically tokenizes, so we use a single hasAll call
+          if (hasSeparators) {
+            // Multi-term: hasAll(tokens(...), tokens('foo bar')) AND LIKE fallback
+            return `(${isNegatedField ? 'NOT (' : ''}${[
+              `hasAll(${bloomIndex.indexExpression}, ${termTokensExpression})`,
+              // If there are token separators in the term, try to match the whole term as well
+              SqlString.format(`(lower(?) LIKE lower(?))`, [
+                SqlString.raw(column),
+                `%${escapeLikePattern(term)}%`,
+              ]),
+            ].join(' AND ')}${isNegatedField ? ')' : ''})`;
+          } else {
+            // Single term: hasAll(tokens(...), tokens('term'))
+            return `(${isNegatedField ? 'NOT ' : ''}hasAll(${bloomIndex.indexExpression}, ${termTokensExpression}))`;
+          }
+        }
+
+        // Fallback to using tokenbf_v1 indices if no bloom_filter index is found
+        if (hasSeparators) {
+          const tokens = this.tokenizeTerm(term);
+          return `(${isNegatedField ? 'NOT (' : ''}${[
+            ...tokens.map(token =>
+              SqlString.format(`hasToken(lower(?), lower(?))`, [
+                SqlString.raw(column),
+                token,
+              ]),
+            ),
+            // If there are symbols in the term, try to match the whole term as well
+            SqlString.format(`(lower(?) LIKE lower(?))`, [
+              SqlString.raw(column),
+              `%${escapeLikePattern(term)}%`,
+            ]),
+          ].join(' AND ')}${isNegatedField ? ')' : ''})`;
+        } else {
+          return SqlString.format(
+            `(${isNegatedField ? 'NOT ' : ''}hasToken(lower(?), lower(?)))`,
+            [SqlString.raw(column), term],
+          );
+        }
+      }
+    }
+
+    return SqlString.format(
+      `(${column} ${isNegatedField ? 'NOT ' : ''}? ?${expressionPostfix})`,
+      [SqlString.raw('ILIKE'), `%${escapeLikePattern(term)}%`],
+    );
+  }
+
+  /**
+   * Translate field from user ex. column.property.subproperty to SQL expression
+   * Supports:
+   * - Materialized Columns
+   * - Map
+   * - JSON Strings (via JSONExtract)
+   * TODO:
+   * - Nested Map
+   * - JSONExtract for non-string types
+   */
+  private async buildColumnExpressionFromField(
+    field: string,
+  ): Promise<CustomSchemaSQLColumnExpression> {
+    const exactMatch = await this.metadata.getColumn({
+      databaseName: this.databaseName,
+      tableName: this.tableName,
+      column: field,
+      connectionId: this.connectionId,
+    });
+
+    if (exactMatch) {
+      const columnExpression: CustomSchemaSQLColumnExpression = {
+        found: true,
+        columnType: exactMatch.type,
+        columnExpression: exactMatch.name,
+        // TODO
+        // Add JSON exactMatch if want to support whole json compare in future, ex: json:"{a: 1234}""
+      };
+      let materializedColumns: Map<string, string>;
+      try {
+        // This won't work for CTEs
+        materializedColumns =
+          await this.metadata.getMaterializedColumnsLookupTable({
+            databaseName: this.databaseName,
+            tableName: this.tableName,
+            connectionId: this.connectionId,
+          });
+      } catch (e) {
+        console.debug('Error in getMaterializedColumnsLookupTable', e);
+        materializedColumns = new Map();
+      }
+      const materializedColumn = (() => {
+        for (const [
+          materializedTarget,
+          materializedName,
+        ] of materializedColumns.entries()) {
+          if (materializedName === field) {
+            return { materializedTarget, materializedName };
+          }
+        }
+        return undefined;
+      })();
+      if (materializedColumn) {
+        const mapContainsStatement = buildMapContains(
+          materializedColumn.materializedTarget,
+        );
+        if (mapContainsStatement) {
+          columnExpression.mapKeyIndexExpression = `indexHint(${mapContainsStatement})`;
+        }
+      }
+      return columnExpression;
+    }
+
+    const prefixMatch = await findPrefixMatch({
+      field,
+      metadata: this.metadata,
+      databaseName: this.databaseName,
+      tableName: this.tableName,
+      connectionId: this.connectionId,
+    });
+
+    if (prefixMatch) {
+      const prefixParts = prefixMatch.name.split('.');
+      const fieldPostfix = field.split('.').slice(prefixParts.length).join('.');
+
+      if (prefixMatch.type.startsWith('Map')) {
+        const valueType = prefixMatch.type.match(/,\s+(\w+)\)$/)?.[1];
+
+        // Check if a KV items index exists for this map column
+        const textIndexInfoLookup = await this.textIndexInfoLookupPromise;
+        const textIndexInfo = textIndexInfoLookup?.get(prefixMatch.name);
+
+        return {
+          found: true,
+          columnExpression: SqlString.format(`??[?]`, [
+            prefixMatch.name,
+            fieldPostfix,
+          ]),
+          mapKeyIndexExpression: `indexHint(${buildMapContains(`${prefixMatch.name}['${fieldPostfix}']`)})`,
+          columnType: valueType ?? 'Unknown',
+          mapKey: fieldPostfix,
+          ...(textIndexInfo
+            ? {
+                textIndexInfo: {
+                  kv: textIndexInfo.kv,
+                  key: textIndexInfo.key,
+                },
+              }
+            : {}),
+        };
+      } else if (prefixMatch.type.startsWith('JSON')) {
+        // ignore original column expression at here
+        // need to know the term to decide which expression to read
+        // TODO: add real columnExpression when CH update JSON data type
+        return {
+          found: true,
+          columnExpression: '',
+          columnExpressionJSON: {
+            string: SqlString.format(`toString(??)`, [field]),
+            number: SqlString.format(`dynamicType(??) in (?) and ??`, [
+              field,
+              CLICK_HOUSE_JSON_NUMBER_TYPES,
+              field,
+            ]),
+          },
+          columnType: 'JSON',
+        };
+      } else if (prefixMatch.type === 'String') {
+        // TODO: Support non-strings
+        const nestedPaths = fieldPostfix.split('.');
+        return {
+          found: true,
+          columnExpression: SqlString.format(
+            `JSONExtractString(??, ${Array(nestedPaths.length)
+              .fill('?')
+              .join(',')})`,
+            [prefixMatch.name, ...nestedPaths],
+          ),
+          columnType: 'String',
+        };
+      } else if (prefixMatch.type.startsWith('Array')) {
+        return {
+          found: true,
+          columnType: prefixMatch.type,
+          columnExpression: prefixMatch.name,
+          arrayMapKeyExpression: fieldPostfix,
+        };
+      }
+      // TODO: Support tuples
+      throw new Error('Unsupported column type for prefix match');
+    }
+
+    // It might be an alias, let's just try the column
+    // TODO: Verify aliases
+    return {
+      found: true,
+      columnExpression: field,
+      columnType: 'Unknown',
+    };
+    // throw new Error(`Column not found: ${field}`);
+  }
+
+  private isLowerExpression(expr: string): boolean {
+    return /\blower\s*\(/i.test(expr);
+  }
+
+  private async findTextIndex(
+    columnExpression: string,
+  ): Promise<{ index: SkipIndexMetadata; indexHasLower: boolean } | undefined> {
+    const skipIndices = await this.skipIndicesPromise;
+
+    if (!skipIndices || skipIndices.length === 0) {
+      return undefined;
+    }
+
+    const idx = skipIndices.find(
+      idx =>
+        idx.type === 'text' &&
+        this.indexCoversColumn(idx.expression, columnExpression),
+    );
+
+    if (!idx) {
+      return undefined;
+    }
+
+    const normalizedExpr = normalizeChExpression(idx.expression);
+    const normalizedCol = normalizeChExpression(columnExpression);
+    const indexHasLower =
+      normalizedExpr !== normalizedCol &&
+      this.isLowerExpression(idx.expression);
+
+    return { index: idx, indexHasLower };
+  }
+
+  /**
+   * Finds a bloom_filter skip index that uses tokens() on the given column expression.
+   * Returns the full index expression if found, otherwise returns not found.
+   *
+   * Note: Ignores tokenbf_v1 indices (those are handled by existing hasToken logic).
+   */
+  private async findBloomFilterTokensIndex(columnExpression: string): Promise<
+    | {
+        found: true;
+        indexExpression: string;
+      }
+    | { found: false }
+  > {
+    try {
+      const skipIndices = await this.skipIndicesPromise;
+
+      if (!skipIndices || skipIndices.length === 0) {
+        return { found: false };
+      }
+
+      // Look for bloom_filter indices (not tokenbf_v1)
+      const bloomFilterIndices = skipIndices.filter(
+        idx => idx.type === 'bloom_filter',
+      );
+
+      // Find index that uses tokens() on a matching column
+      for (const index of bloomFilterIndices) {
+        const parsed = Metadata.parseTokensExpression(index.expression);
+
+        if (parsed.hasTokens) {
+          // Match the inner expression against our column
+          if (
+            this.indexCoversColumn(parsed.innerExpression, columnExpression)
+          ) {
+            return {
+              found: true,
+              indexExpression: index.expression, // e.g., "tokens(lower(Body))"
+            };
+          }
+        }
+      }
+
+      return { found: false };
+    } catch (error) {
+      // If index lookup fails, fall back to default behavior
+      console.warn('Failed to fetch skip indices:', error);
+      return { found: false };
+    }
+  }
+
+  /**
+   * Compares two expressions to determine if the index expression refers to the search column.
+   * Handles cases where index expression may have transformations like lower(Body) vs Body.
+   */
+  indexCoversColumn(indexExpression: string, searchColumn: string): boolean {
+    const normalizedIndex = normalizeChExpression(indexExpression);
+    const normalizedSearch = normalizeChExpression(searchColumn);
+
+    // Direct match
+    if (normalizedIndex === normalizedSearch) {
+      return true;
+    }
+
+    // Check if index expression contains the search column
+    // E.g., lower(Body) should match Body, concatWithSeparator(';',Body,Message) should match Body
+    // Extract potential column names (alphanumeric + underscore)
+    const indexExpressionWords = normalizedIndex.match(/\w+/g);
+    const searchColumnName = normalizedSearch.match(/\w+/)?.[0];
+    if (
+      searchColumnName &&
+      indexExpressionWords &&
+      indexExpressionWords.includes(searchColumnName)
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async getColumnForField(field: string, context: SerializerContext) {
+    // Fall back to bodyExpression for implicit column expression.
+    // values can be empty if previously configured then removed.
+    const implicitColumnExpression =
+      context.implicitColumnExpression ||
+      this.implicitColumnExpression ||
+      context.bodyExpression ||
+      this.bodyExpression;
+    if (field === IMPLICIT_FIELD && !implicitColumnExpression) {
+      throw new Error(
+        'Can not search bare text without an implicit column set.',
+      );
+    }
+
+    const fieldFinal =
+      field === IMPLICIT_FIELD ? implicitColumnExpression! : field;
+
+    // Use the multi-column-concat path whenever the resolved expression came
+    // from the source (either `this.implicitColumnExpression` or its body
+    // fallback `this.bodyExpression`), not when a per-context override was
+    // applied. Mirrors the original "source's implicit column has not been
+    // overridden" intent.
+    const isSourceImplicit =
+      !context.implicitColumnExpression && !context.bodyExpression;
+    if (field === IMPLICIT_FIELD && isSourceImplicit) {
+      // Sources can specify multi-column implicit columns, eg. Body and Message, in
+      // which case we search the combined string `concatWithSeparator(';', Body, Message)`.
+      const expressions = splitAndTrimWithBracket(fieldFinal);
+
+      return {
+        column:
+          expressions.length > 1
+            ? `concatWithSeparator(';',${expressions.join(',')})`
+            : fieldFinal,
+        columnJSON: undefined,
+        propertyType: JSDataType.String,
+        found: true,
+      };
+    }
+
+    const expression = await this.buildColumnExpressionFromField(fieldFinal);
+
+    const { type, isArray } = convertCHTypeToLuceneSearchType(
+      expression.columnType,
+    );
+
+    return {
+      column: expression.columnExpression,
+      columnJSON: expression?.columnExpressionJSON,
+      propertyType: type ?? undefined,
+      isArray,
+      found: expression.found,
+      mapKey: expression.mapKey,
+      mapKeyIndexExpression: expression.mapKeyIndexExpression,
+      arrayMapKeyExpression: isArray
+        ? expression.arrayMapKeyExpression
+        : undefined,
+      kvItemsExpression:
+        expression.textIndexInfo?.kv && expression.mapKey
+          ? { ...expression.textIndexInfo.kv, mapKey: expression.mapKey }
+          : undefined,
+    };
+  }
+}
+
+async function nodeTerm(
+  node: lucene.Node,
+  serializer: Serializer,
+  context: SerializerContext,
+): Promise<string> {
+  const field = node.field[0] === '-' ? node.field.slice(1) : node.field;
+  let isNegatedField = node.field[0] === '-';
+  const isImplicitField = node.field === IMPLICIT_FIELD;
+
+  // NodeTerm
+  if (isNodeTerm(node)) {
+    const nodeTerm = node;
+    let term = decodeSpecialTokens(nodeTerm.term);
+    // We should only negate the search for negated bare terms (ex. '-5')
+    // This means the field is implicit and the prefix is -
+    if (isImplicitField && nodeTerm.prefix === '-') {
+      isNegatedField = true;
+    }
+    // Otherwise, if we have a negated term for a field (ex. 'level:-5')
+    // we should not negate the search, and search for -5
+    if (!isImplicitField && nodeTerm.prefix === '-') {
+      term = nodeTerm.prefix + decodeSpecialTokens(nodeTerm.term);
+    }
+
+    // TODO: Decide if this is good behavior
+    // If the term is quoted, we should search for the exact term in a property (ex. foo:"bar")
+    // Implicit field searches should still use substring matching (ex. "foo bar")
+    if (nodeTerm.quoted && !isImplicitField) {
+      return serializer.eq(field, term, isNegatedField, context);
+    }
+
+    if (!nodeTerm.quoted && term === '*') {
+      return serializer.isNotNull(field, isNegatedField, context);
+    }
+
+    if (!nodeTerm.quoted && term.substring(0, 2) === '>=') {
+      if (isNegatedField) {
+        return serializer.lt(field, term.slice(2), context);
+      }
+      return serializer.gte(field, term.slice(2), context);
+    }
+    if (!nodeTerm.quoted && term.substring(0, 2) === '<=') {
+      if (isNegatedField) {
+        return serializer.gt(field, term.slice(2), context);
+      }
+      return serializer.lte(field, term.slice(2), context);
+    }
+    if (!nodeTerm.quoted && term[0] === '>') {
+      if (isNegatedField) {
+        return serializer.lte(field, term.slice(1), context);
+      }
+      return serializer.gt(field, term.slice(1), context);
+    }
+    if (!nodeTerm.quoted && term[0] === '<') {
+      if (isNegatedField) {
+        return serializer.gte(field, term.slice(1), context);
+      }
+      return serializer.lt(field, term.slice(1), context);
+    }
+
+    let prefixWildcard = false;
+    let suffixWildcard = false;
+    if (!nodeTerm.quoted && term[0] === '*') {
+      prefixWildcard = true;
+      term = term.slice(1);
+    }
+    if (!nodeTerm.quoted && term[term.length - 1] === '*') {
+      suffixWildcard = true;
+      term = term.slice(0, -1);
+    }
+
+    return serializer.fieldSearch(
+      field,
+      term,
+      isNegatedField,
+      prefixWildcard,
+      suffixWildcard,
+      context,
+    );
+
+    // TODO: Handle regex, similarity, boost, prefix
+  }
+  // NodeRangedTerm
+  if (isNodeRangedTerm(node)) {
+    const rangedTerm = node;
+    return serializer.range(
+      field,
+      rangedTerm.term_min,
+      rangedTerm.term_max,
+      isNegatedField,
+      context,
+      rangedTerm.inclusive,
+    );
+  }
+
+  throw new Error(`Unexpected Node type. ${node}`);
+}
+
+function createSerializerContext(
+  currentContext: SerializerContext,
+  ast: lucene.BinaryAST | lucene.LeftOnlyAST,
+) {
+  // For syntax like `foo:(bar baz)` or `foo:("bar baz")`, the implicit field for the inner expression must be `foo`
+  if (ast.field && ast.parenthesized && ast.field !== IMPLICIT_FIELD) {
+    const fieldWithoutNegation = ast.field?.startsWith('-')
+      ? ast.field.slice(1)
+      : ast.field;
+
+    return {
+      ...currentContext,
+      implicitColumnExpression: fieldWithoutNegation,
+      ...(isNegatedAndParenthesized(ast)
+        ? { isNegatedAndParenthesized: true }
+        : {}),
+    };
+  } else {
+    return currentContext;
+  }
+}
+
+/** Returns true if the AST is of the form `-[field]:([terms...])` */
+function isNegatedAndParenthesized(ast: lucene.BinaryAST | lucene.LeftOnlyAST) {
+  return ast.parenthesized && ast.field?.startsWith('-');
+}
+
+async function serialize(
+  ast: lucene.AST | lucene.Node,
+  serializer: Serializer,
+  context: SerializerContext,
+): Promise<string> {
+  // Node Scenarios:
+  // 1. NodeTerm: Single term ex. "foo:bar"
+  // 2. NodeRangedTerm: Two terms ex. "foo:[bar TO qux]"
+  if (isNodeTerm(ast)) {
+    return await nodeTerm(ast, serializer, context);
+  }
+  if (isNodeRangedTerm(ast)) {
+    return await nodeTerm(ast, serializer, context);
+  }
+
+  // AST Scenarios:
+  // 1. BinaryAST: Two terms ex. "foo:bar AND baz:qux"
+  // 2. LeftOnlyAST: Single term ex. "foo:bar"
+  if (isBinaryAST(ast)) {
+    const binaryAST = ast;
+    const operator = serializer.operator(binaryAST.operator, context);
+    const parenthesized = binaryAST.parenthesized;
+
+    const newContext = createSerializerContext(context, binaryAST);
+    const serialized = `${isNegatedAndParenthesized(binaryAST) ? 'NOT ' : ''}${parenthesized ? '(' : ''}${
+      hasStart(binaryAST) ? `${binaryAST.start} ` : ''
+    }${await serialize(
+      binaryAST.left,
+      serializer,
+      newContext,
+    )} ${operator} ${await serialize(binaryAST.right, serializer, newContext)}${
+      parenthesized ? ')' : ''
+    }`;
+    return serialized;
+  }
+
+  if (isLeftOnlyAST(ast)) {
+    const leftOnlyAST = ast;
+    const parenthesized = leftOnlyAST.parenthesized;
+
+    const newContext = createSerializerContext(context, leftOnlyAST);
+
+    // start is used when ex. "NOT foo:bar"
+    const serialized = `${isNegatedAndParenthesized(leftOnlyAST) ? 'NOT ' : ''}${parenthesized ? '(' : ''}${
+      leftOnlyAST.start != undefined ? `${leftOnlyAST.start} ` : ''
+    }${await serialize(leftOnlyAST.left, serializer, newContext)}${
+      parenthesized ? ')' : ''
+    }`;
+
+    return serialized;
+  }
+
+  // Blank AST, means no text was parsed
+  return '';
+}
+
+// TODO: can just inline this within getSearchQuery
+export async function genWhereSQL(
+  ast: lucene.AST,
+  serializer: Serializer,
+): Promise<string> {
+  return await serialize(ast, serializer, {});
+}
+
+export class SearchQueryBuilder {
+  private readonly searchQ: string;
+
+  private readonly conditions: string[];
+
+  private serializer: SQLSerializer;
+
+  constructor(searchQ: string, serializer: SQLSerializer) {
+    this.conditions = [];
+    this.searchQ = searchQ;
+    // init default serializer
+    this.serializer = serializer;
+  }
+
+  setSerializer(serializer: SQLSerializer) {
+    this.serializer = serializer;
+    return this;
+  }
+
+  getSerializer() {
+    return this.serializer;
+  }
+
+  private async genSearchQuery() {
+    if (!this.searchQ) {
+      return '';
+    }
+
+    const parsedQ = parse(this.searchQ);
+
+    return await genWhereSQL(parsedQ, this.serializer);
+  }
+
+  and(condition: string) {
+    if (condition && condition.trim()) {
+      this.conditions.push(`(${condition})`);
+    }
+    return this;
+  }
+
+  async build() {
+    const searchQuery = await this.genSearchQuery();
+    if (this.searchQ) {
+      this.and(searchQuery);
+    }
+    return this.conditions.join(' AND ');
+  }
+}
+
+export async function genEnglishExplanation({
+  query,
+  metadata,
+  tableConnection,
+}: {
+  query: string;
+  tableConnection: TableConnection;
+  metadata: Metadata;
+}): Promise<string> {
+  try {
+    const { tableName, databaseName, connectionId } = tableConnection;
+    const parsedQ = parse(query);
+
+    if (parsedQ && tableName && databaseName && connectionId) {
+      const serializer = new EnglishSerializer({
+        metadata,
+        tableName,
+        databaseName,
+        connectionId,
+      });
+      return await serialize(parsedQ, serializer, {});
+    }
+  } catch (e) {
+    console.warn('Parse failure', query, e);
+  }
+
+  return `Message containing ${query}`;
+}

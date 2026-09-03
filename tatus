@@ -1,0 +1,48 @@
+[35mpackages/api/openapi.json[m[36m:[m[32m4499[m[36m:[m            "example": "https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+[35mpackages/api/openapi.json[m[36m:[m[32m4725[m[36m:[m            "example": "https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+[35mpackages/api/src/mcp/__tests__/webhooks.int.test.ts[m[36m:[m[32m71[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T000/B000/XXXX',
+[35mpackages/api/src/mcp/__tests__/webhooks.int.test.ts[m[36m:[m[32m83[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T000/B000/XXXX',
+[35mpackages/api/src/routers/api/__tests__/alerts.int.test.ts[m[36m:[m[32m53[m[36m:[m      url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/api/__tests__/dashboard.int.test.ts[m[36m:[m[32m57[m[36m:[m      url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/api/__tests__/savedSearch.int.test.ts[m[36m:[m[32m40[m[36m:[m      url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m11[m[36m:[m  url: 'https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m63[m[36m:[m    expect(response.body.data[0].url).toBe('https://[1;31mhooks.slack.com[m/****');
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m111[m[36m:[m    expect(response.body.data.url).toBe('https://[1;31mhooks.slack.com[m/****');
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m156[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T22222222/B22222222/mock-not-a-real-token',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m327[m[36m:[m          url: 'https://[1;31mhooks.slack.com[m/valid-headers',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m425[m[36m:[m          url: 'https://[1;31mhooks.slack.com[m/valid-header-values',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m634[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T11111111/B11111111/YYYYYYYYYYYYYYYYYYYYYYYY',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m653[m[36m:[m      expect(response.body.data.url).toBe('https://[1;31mhooks.slack.com[m/****');
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m694[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T11111111/B11111111/YYYYYYYYYYYYYYYYYYYYYYYY',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m789[m[36m:[m      expect(response.body.data[0].url).toBe('https://[1;31mhooks.slack.com[m/****');
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m804[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T00/B00/XXX',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m831[m[36m:[m          url: 'https://[1;31mhooks.slack.com[m/****',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m849[m[36m:[m      const newUrl = 'https://[1;31mhooks.slack.com[m/webhook/new-endpoint';
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m1066[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/T11/B11/YYY',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m1077[m[36m:[m          url: 'https://[1;31mhooks.slack.com[m/****',
+[35mpackages/api/src/routers/api/__tests__/webhooks.int.test.ts[m[36m:[m[32m1361[m[36m:[m          url: 'https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX',
+[35mpackages/api/src/routers/external-api/__tests__/alerts.int.test.ts[m[36m:[m[32m61[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/external-api/__tests__/dashboards.int.test.ts[m[36m:[m[32m5064[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/external-api/__tests__/dashboards.int.test.ts[m[36m:[m[32m5170[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/test',
+[35mpackages/api/src/routers/external-api/__tests__/webhooks.int.test.ts[m[36m:[m[32m16[m[36m:[m  url: 'https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX',
+[35mpackages/api/src/routers/external-api/v2/webhooks.ts[m[36m:[m[32m130[m[36m:[m *           example: https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
+[35mpackages/api/src/routers/external-api/v2/webhooks.ts[m[36m:[m[32m401[m[36m:[m *           example: https://[1;31mhooks.slack.com[m/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1617[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1652[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1679[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1709[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1739[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1769[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1775[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/456',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1846[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1875[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/456',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1910[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m1937[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m2015[m[36m:[m        url: 'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m2385[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m2398[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m2775[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m6491[m[36m:[m        'https://[1;31mhooks.slack.com[m/services/123',
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m6669[m[36m:[m      expect(messages[0].url).toBe('https://[1;31mhooks.slack.com[m/services/123');
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m:[m[32m6670[m[36m:[m      expect(messages[1].url).toBe('https://[1;31mhooks.slack.com[m/services/123');
+[35mpackages/api/src/tasks/checkAlerts/__tests__/checkAlerts.int.test.ts[m[36m

@@ -1,0 +1,86 @@
+.sectionHeader {
+  border-bottom: 1px solid var(--color-border);
+  margin-top: 30px;
+  padding-bottom: 10px;
+  font-size: 14px;
+  color: var(--color-text-muted);
+}
+
+.historyCardWrapper {
+  display: flex;
+  flex-direction: row;
+
+  &:hover {
+    .historyCard {
+      opacity: 0.3;
+    }
+  }
+}
+
+.historyCard {
+  width: 4px;
+  height: 16px;
+  background-color: var(--color-bg-muted);
+  border-radius: 2px;
+  margin: 0 1px;
+  cursor: default;
+  transition: opacity 0.1s ease-in;
+
+  &:hover {
+    transition: none;
+    opacity: 1 !important;
+  }
+
+  &.ok {
+    background-color: var(--color-bg-success);
+  }
+
+  &.alarm {
+    background-color: var(--color-bg-danger);
+  }
+
+  &.pending {
+    background-color: var(--color-bg-warning);
+  }
+
+  // Errored evaluation: striped red so it reads as "bad" but is visually
+  // distinct from a solid firing (alarm) segment.
+  &.error {
+    background-color: var(--color-bg-danger);
+    background-image: repeating-linear-gradient(
+      -45deg,
+      transparent 0 2px,
+      rgb(0 0 0 / 45%) 2px 4px
+    );
+  }
+
+  &.clickable {
+    cursor: pointer;
+  }
+}
+
+// Child rows (per-group breakdown / error details) under an evaluation
+// window row in the alert detail page's event stream. Muted background keeps
+// parent windows visually dominant when several are expanded.
+.evaluationChildRow {
+  background-color: var(--color-bg-muted);
+}
+
+.alertRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.alertLink {
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  text-decoration: none;
+
+  &:hover {
+    color: var(--color-text);
+  }
+}

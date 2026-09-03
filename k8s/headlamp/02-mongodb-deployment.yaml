@@ -1,0 +1,61 @@
+# mongo:5.0.14-focal + tcpSocket probes — cùng version/kiểu probe với bản
+# HyperDX Helm chart chính thức bạn đã thấy chạy ổn ở namespace logging.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: sandbox
+  labels:
+    app: db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:5.0.14-focal
+          ports:
+            - containerPort: 27017
+              protocol: TCP
+          volumeMounts:
+            - name: db-data
+              mountPath: /data/db
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          livenessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: db-data

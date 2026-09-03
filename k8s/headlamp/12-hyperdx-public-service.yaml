@@ -1,0 +1,22 @@
+# Service RIÊNG chỉ để lấy đúng domain public bạn muốn:
+#   https://hyperdx.sandbox.kamimind.ai/
+# (vì wildcard proxy dùng đúng tên Service làm hostname, và Service
+# "hyperdx-api" đã tồn tại/đang dùng nội bộ nên không đổi tên được — Service
+# name trong Kubernetes là immutable, phải xoá mới đổi tên được, mà bạn không
+# có quyền delete).
+#
+# Đây là 1 Service MỚI, tên "hyperdx", cùng selector "app: hyperdx-api" nên
+# trỏ vào ĐÚNG pod hyperdx-api đang chạy — không đụng, không xoá, không sửa gì
+# Service/Deployment cũ. Chỉ cần bấm Create với file này.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperdx
+  namespace: sandbox
+spec:
+  selector:
+    app: hyperdx-api
+  ports:
+    - name: app
+      port: 80
+      targetPort: 3000

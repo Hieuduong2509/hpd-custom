@@ -1,0 +1,34 @@
+# Job dùng 1 LẦN để xoá sạch dữ liệu ClickHouse (toàn bộ log/trace/metric/
+# session đã ingest) mà KHÔNG cần quyền delete hay exec — chỉ cần Create.
+# Dán qua nút Create trong Headlamp, đợi Job Completed.
+#
+# DROP rồi CREATE lại database "default" ngay trong cùng 1 lệnh (không để
+# trống khoảng thời gian database không tồn tại). Sau đó BẮT BUỘC phải
+# force-restart pod otel-collector (đổi imagePullPolicy hoặc bump lại
+# annotation trong 08-otel-collector-deployment.yaml) để nó tự seed lại
+# toàn bộ schema/table rỗng — otel-collector luôn tự chạy lại các file
+# schema/seed/*.sql (idempotent) mỗi lần khởi động.
+#
+# Muốn chạy lại lần 2: đổi metadata.name (vd. reset-clickhouse-2).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reset-clickhouse
+  namespace: sandbox
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: reset
+          image: clickhouse/clickhouse-server:25.7-alpine
+          command:
+            - /bin/sh
+            - "-c"
+            - |
+              clickhouse-client --host ch-server --port 9000 --user default \
+                --query "DROP DATABASE IF EXISTS default" &&
+              clickhouse-client --host ch-server --port 9000 --user default \
+                --query "CREATE DATABASE default"

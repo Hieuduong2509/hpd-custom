@@ -1,0 +1,142 @@
+import { useCallback, useMemo } from 'react';
+import { useController, UseControllerProps } from 'react-hook-form';
+import { MetricsDataType } from '@hyperdx/common-utils/dist/types';
+import { Select } from '@mantine/core';
+
+import { AGG_FNS } from '@/ChartUtils';
+
+type AggFnValues = (typeof AGG_FNS)[number]['value'];
+
+// aggFn form values that are supported for histogram metrics.
+export const HISTOGRAM_SUPPORTED_AGG_FNS: string[] = ['count', 'quantile'];
+
+// Displayed versions of the supported aggregation functions for histogram metrics.
+const HISTOGRAM_SUPPORTED_AGG_FNS_DISPLAY: AggFnValues[] = [
+  'count',
+  'p99',
+  'p95',
+  'p90',
+  'p50',
+];
+
+type OnChangeValue =
+  | { aggFn?: AggFnValues }
+  | { aggFn: 'quantile'; level: number };
+function AggFnSelect({
+  value,
+  defaultValue,
+  onChange,
+  hideCustom,
+  metricType,
+}: {
+  value: string;
+  defaultValue: string;
+  onChange: (value: OnChangeValue) => void;
+  hideCustom?: boolean;
+  metricType?: MetricsDataType;
+}) {
+  const _onChange = useCallback(
+    (value: string | null) => {
+      if (value == null) {
+        onChange({});
+      } else if (['p50', 'p90', 'p95', 'p99'].includes(value)) {
+        onChange({
+          aggFn: 'quantile',
+          level: Number.parseFloat(value.replace('p', '0.')),
+        });
+      } else {
+        // @ts-expect-error Mantine Select passes a string; onChange expects a narrowed AggFn union
+        onChange({ aggFn: value });
+      }
+    },
+    [onChange],
+  );
+
+  const options = useMemo(() => {
+    let opts = hideCustom ? AGG_FNS.filter(fn => fn.value !== 'none') : AGG_FNS;
+    // Only show 'increase' when the source is a Sum (counter) metric.
+    if (metricType !== MetricsDataType.Sum) {
+      opts = opts.filter(fn => fn.value !== 'increase');
+    }
+    // Filter out unsupported aggregation functions for histogram metrics.
+    if (
+      metricType === MetricsDataType.Histogram ||
+      metricType === MetricsDataType.ExponentialHistogram
+    ) {
+      opts = opts.filter(fn =>
+        HISTOGRAM_SUPPORTED_AGG_FNS_DISPLAY.includes(fn.value),
+      );
+    }
+    return opts;
+  }, [hideCustom, metricType]);
+
+  return (
+    <Select
+      withScrollArea={false}
+      searchable
+      value={value}
+      defaultValue={defaultValue}
+      onChange={_onChange}
+      data={options}
+      data-testid="agg-fn-select"
+    />
+  );
+}
+
+export function AggFnSelectControlled({
+  aggFnName,
+  quantileLevelName,
+  defaultValue,
+  hideCustom,
+  metricType,
+  ...props
+}: {
+  defaultValue: string;
+  aggFnName: string;
+  quantileLevelName: string;
+  hideCustom?: boolean;
+  metricType?: MetricsDataType;
+} & Omit<UseControllerProps<any>, 'name'>) {
+  const {
+    field: { onChange: onAggFnChange, value: aggFnValue },
+  } = useController({
+    ...props,
+    name: aggFnName,
+  });
+
+  const {
+    field: { onChange: onQuantileLevelChange, value: quantileLevelValue },
+  } = useController({
+    ...props,
+    name: quantileLevelName,
+  });
+
+  const onChange = useCallback(
+    (value: OnChangeValue) => {
+      if (value.aggFn === 'quantile') {
+        onQuantileLevelChange(value.level);
+        onAggFnChange(value.aggFn);
+      } else {
+        onAggFnChange(value.aggFn);
+      }
+    },
+    [onAggFnChange, onQuantileLevelChange],
+  );
+
+  const value = useMemo(() => {
+    if (aggFnValue === 'quantile') {
+      return `p${Math.round(quantileLevelValue * 100)}`;
+    }
+    return aggFnValue;
+  }, [aggFnValue, quantileLevelValue]);
+
+  return (
+    <AggFnSelect
+      value={value}
+      defaultValue={defaultValue}
+      onChange={onChange}
+      hideCustom={hideCustom}
+      metricType={metricType}
+    />
+  );
+}

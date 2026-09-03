@@ -1,0 +1,225 @@
+# API + App gộp 1 pod (đúng kiểu bạn đã dùng trước đây: 1 pod db, 1 pod
+# clickhouse, 1 pod hyperdx). Thêm initContainer chờ MongoDB sẵn sàng (tránh
+# app crash-loop lúc mongo chưa kịp lên). DEFAULT_SOURCES thêm Metrics và
+# Sessions (đúng mẫu bạn đã thấy chạy ổn ở namespace logging) — nếu không
+# thêm, HyperDX chỉ có Logs/Traces như bản cũ, thiếu trang Metrics/Sessions.
+# HYPERDX_API_KEY để plain value vì không có quyền Secret.
+# FRONTEND_URL = https://hyperdx.sandbox.kamimind.ai — khớp với Service MỚI
+# tên "hyperdx" (file 12-hyperdx-public-service.yaml), không phải Service
+# "hyperdx-api" (đó vẫn giữ nguyên, chỉ dùng nội bộ cluster).
+# BUG ĐÃ VÁ: source "Logs" trước đây dùng timestampValueExpression:
+# "TimestampTime" (copy từ mẫu namespace logging, chạy ClickHouse bản mới
+# hơn 26.2 có cột TimestampTime riêng cho bảng otel_logs). ClickHouse bạn
+# đang chạy (25.7-alpine, < 26.2) dùng schema "compatibility"
+# (docker/otel-collector/schema/seed/00002_otel_logs_compat.sql) — bảng
+# otel_logs ở đây CHỈ có cột "Timestamp", không có "TimestampTime" → mọi
+# query xem Logs báo lỗi "Unknown expression or function identifier
+# TimestampTime". Đã đổi lại thành "Timestamp" cho đúng schema thật.
+# (Traces/Sessions không bị lỗi này: Traces vốn đã dùng đúng "Timestamp",
+# còn bảng hyperdx_sessions có cột TimestampTime thật nên Sessions giữ
+# nguyên "TimestampTime".)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperdx-api
+  namespace: sandbox
+  labels:
+    app: hyperdx-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperdx-api
+  template:
+    metadata:
+      labels:
+        app: hyperdx-api
+    spec:
+      initContainers:
+        - name: wait-for-mongodb
+          image: busybox:1.36
+          command:
+            - sh
+            - "-c"
+            - "until nc -z db 27017; do echo waiting for mongodb; sleep 2; done;"
+          imagePullPolicy: IfNotPresent
+      containers:
+        - name: api
+          image: hieuduongnewai/hyperdx:latest
+          # Always, không phải IfNotPresent: node đã cache image tên
+          # "hieuduongnewai/hyperdx:latest" từ lần deploy đầu, nên restart
+          # pod (kể cả bump annotation) KHÔNG tự kiểm tra lại Docker Hub —
+          # phải Always để mỗi lần pod khởi động lại đều tải bản mới nhất
+          # nếu bạn đã build+push lại. Đây là nguyên nhân khiến code sửa
+          # (RLS theo API key) không có hiệu lực dù đã build+push+restart.
+          imagePullPolicy: Always
+          ports:
+            - name: app-port
+              containerPort: 3000
+              protocol: TCP
+            - name: api-port
+              containerPort: 8000
+              protocol: TCP
+            - name: opamp-port
+              containerPort: 4320
+              protocol: TCP
+          env:
+            - name: HYPERDX_API_KEY
+              value: "bdb7b60d-59f0-45a6-91c1-f3396aec9d0e"
+            - name: HYPERDX_API_PORT
+              value: "8000"
+            - name: HYPERDX_APP_PORT
+              value: "3000"
+            - name: FRONTEND_URL
+              value: "https://hyperdx.sandbox.kamimind.ai"
+            - name: SERVER_URL
+              value: "http://hyperdx-api:8000"
+            - name: HYPERDX_LOG_LEVEL
+              value: "debug"
+            - name: MONGO_URI
+              value: "mongodb://db:27017/hyperdx"
+            - name: OPAMP_PORT
+              value: "4320"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector-service:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "hdx-oss-app"
+            - name: USAGE_STATS_ENABLED
+              value: "true"
+            - name: CLICKHOUSE_HOST
+              value: "http://ch-server:8123"
+            - name: DEFAULT_CONNECTIONS
+              value: |
+                [
+                  {
+                    "id": "local-ch-id",
+                    "name": "Local ClickHouse",
+                    "host": "http://ch-server:8123",
+                    "port": 8123,
+                    "username": "app",
+                    "password": "hyperdx"
+                  }
+                ]
+            - name: DEFAULT_SOURCES
+              value: |
+                [
+                  {
+                    "from": { "databaseName": "default", "tableName": "otel_logs" },
+                    "kind": "log",
+                    "timestampValueExpression": "Timestamp",
+                    "name": "Logs",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "Body",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "Body",
+                    "eventAttributesExpression": "LogAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,SeverityText,Body",
+                    "severityTextExpression": "SeverityText",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "connection": "Local ClickHouse",
+                    "traceSourceId": "Traces",
+                    "sessionSourceId": "Sessions",
+                    "metricSourceId": "Metrics"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "otel_traces" },
+                    "kind": "trace",
+                    "timestampValueExpression": "Timestamp",
+                    "name": "Traces",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "SpanName",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "SpanName",
+                    "eventAttributesExpression": "SpanAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "durationExpression": "Duration",
+                    "durationPrecision": 9,
+                    "parentSpanIdExpression": "ParentSpanId",
+                    "spanNameExpression": "SpanName",
+                    "spanKindExpression": "SpanKind",
+                    "statusCodeExpression": "StatusCode",
+                    "statusMessageExpression": "StatusMessage",
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "sessionSourceId": "Sessions",
+                    "metricSourceId": "Metrics"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "" },
+                    "kind": "metric",
+                    "timestampValueExpression": "TimeUnix",
+                    "name": "Metrics",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "metricTables": {
+                      "gauge": "otel_metrics_gauge",
+                      "histogram": "otel_metrics_histogram",
+                      "sum": "otel_metrics_sum"
+                    },
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "traceSourceId": "Traces",
+                    "sessionSourceId": "Sessions"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "hyperdx_sessions" },
+                    "kind": "session",
+                    "timestampValueExpression": "TimestampTime",
+                    "name": "Sessions",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "Body",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "Body",
+                    "eventAttributesExpression": "LogAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,SeverityText,Body",
+                    "severityTextExpression": "SeverityText",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "traceSourceId": "Traces",
+                    "metricSourceId": "Metrics"
+                  }
+                ]
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTP
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600

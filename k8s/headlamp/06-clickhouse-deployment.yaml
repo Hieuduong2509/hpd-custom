@@ -1,0 +1,122 @@
+# Cần 04-clickhouse-configmap.yaml, 05-clickhouse-pvc.yaml, 05b-clickhouse-logs-pvc.yaml
+# tạo trước. Thêm startupProbe + lifecycle preStop (flush log trước khi pod bị
+# kill) giống mẫu namespace logging — giúp ClickHouse tắt sạch hơn khi pod
+# restart/reschedule, giảm rủi ro mất dữ liệu chưa flush.
+#
+# LƯU Ý: ClickHouse chỉ đọc users.xml/config.xml lúc pod KHỞI ĐỘNG, không tự
+# reload khi ConfigMap đổi. Mỗi lần sửa nội dung 04-clickhouse-configmap.yaml
+# (vd. đổi quyền user), phải force pod ch-server restart để áp dụng — cách
+# không cần quyền delete: tăng số trong annotation "config-rev" dưới đây rồi
+# Edit lại Deployment này trong Headlamp (đổi spec => strategy Recreate sẽ tự
+# xoá pod cũ, tạo pod mới đọc config mới).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ch-server
+  namespace: sandbox
+  labels:
+    app: ch-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ch-server
+  template:
+    metadata:
+      labels:
+        app: ch-server
+      annotations:
+        config-rev: "2"
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.7-alpine
+          ports:
+            - containerPort: 8123
+              name: http
+              protocol: TCP
+            - containerPort: 9000
+              name: native
+              protocol: TCP
+            - containerPort: 9363
+              name: prometheus
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: ch-config
+              mountPath: /etc/clickhouse-server/config.xml
+              subPath: config.xml
+            - name: ch-config
+              mountPath: /etc/clickhouse-server/users.xml
+              subPath: users.xml
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: logs
+              mountPath: /var/log/clickhouse-server
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - "-c"
+                  - |
+                    clickhouse-client --query "SYSTEM STOP MERGES" || true
+                    clickhouse-client --query "SYSTEM STOP MOVES" || true
+                    clickhouse-client --query "SYSTEM FLUSH LOGS" || true
+                    sleep 5
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 90
+      dnsPolicy: ClusterFirst
+      volumes:
+        - name: ch-config
+          configMap:
+            name: ch-server-config
+            defaultMode: 420
+        - name: data
+          persistentVolumeClaim:
+            claimName: ch-data
+        - name: logs
+          persistentVolumeClaim:
+            claimName: ch-logs

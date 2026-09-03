@@ -1,0 +1,101 @@
+# PHẢI tự build image này (không dùng bản chính thức docker.hyperdx.io/...
+# được nữa) — đã thử dùng image chính thức 2.7.1 và bị lỗi:
+#   'exporters' error reading configuration for "clickhouse": '' has invalid keys: json
+# Nguyên nhân: hyperdx-api (build từ source hiện tại, mới hơn bản release
+# 2.7.1) gửi xuống collector 1 field cấu hình ("json") mà bản otel-collector
+# 2.7.1 chính thức không hiểu — 2 bên lệch phiên bản schema OpAMP. Bắt buộc
+# dùng collector build từ ĐÚNG source code này để khớp phiên bản.
+#
+# CLICKHOUSE_USER/PASSWORD khớp với user "otelcollector" đã tạo trong
+# 04-clickhouse-configmap.yaml. HYPERDX_API_KEY để plain value vì bạn
+# không có quyền tạo Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: sandbox
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: hieuduongnewai/hyperdx-otel-collector:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 13133
+              name: health
+              protocol: TCP
+            - containerPort: 4317
+              name: otlp-grpc
+              protocol: TCP
+            - containerPort: 4318
+              name: otlp-http
+              protocol: TCP
+            - containerPort: 8888
+              name: metrics
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_ENDPOINT
+              value: "tcp://ch-server:9000?dial_timeout=10s"
+            - name: CLICKHOUSE_SERVER_ENDPOINT
+              value: "ch-server:9000"
+            - name: CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT
+              value: "ch-server:9363"
+            - name: CLICKHOUSE_USER
+              value: "otelcollector"
+            - name: CLICKHOUSE_PASSWORD
+              value: "otelcollectorpass"
+            - name: HYPERDX_OTEL_EXPORTER_CLICKHOUSE_DATABASE
+              value: "default"
+            - name: HYPERDX_API_KEY
+              value: "bdb7b60d-59f0-45a6-91c1-f3396aec9d0e"
+            - name: OPAMP_SERVER_URL
+              value: "http://hyperdx-api:4320"
+            - name: HYPERDX_LOG_LEVEL
+              value: "info"
+            - name: OTEL_SUPERVISOR_LOGS
+              value: "true"
+            # Yêu cầu #6: retention 30 ngày. Chỉ áp dụng khi collector tạo
+            # bảng lần đầu lúc khởi động (fresh ClickHouse, đúng trường hợp
+            # namespace sandbox hiện đang trống).
+            - name: HYPERDX_OTEL_EXPORTER_TABLES_TTL
+              value: "720h"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+              scheme: HTTP
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst

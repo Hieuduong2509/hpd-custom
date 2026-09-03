@@ -1,0 +1,117 @@
+#!/bin/sh
+set -e
+
+# DEPRECATED: The clickhouse.json feature gate has been removed upstream.
+# When OTEL_AGENT_FEATURE_GATE_ARG contains clickhouse.json, strip it and
+# map it to HYPERDX_OTEL_EXPORTER_CLICKHOUSE_JSON_ENABLE instead. Other feature gates
+# are preserved and passed through to the collector.
+if echo "$OTEL_AGENT_FEATURE_GATE_ARG" | grep -q "clickhouse.json"; then
+  echo "WARNING: '--feature-gates=clickhouse.json' is deprecated and no longer supported by the collector."
+  echo "WARNING: Use HYPERDX_OTEL_EXPORTER_CLICKHOUSE_JSON_ENABLE=true instead. This flag will be removed in a future release."
+  export HYPERDX_OTEL_EXPORTER_CLICKHOUSE_JSON_ENABLE=true
+
+  # Strip clickhouse.json from the feature gates, keeping any other gates
+  REMAINING_GATES=$(echo "$OTEL_AGENT_FEATURE_GATE_ARG" | sed 's/--feature-gates=//' | tr ',' '\n' | grep -v 'clickhouse.json' | tr '\n' ',' | sed 's/,$//')
+  if [ -n "$REMAINING_GATES" ]; then
+    export OTEL_AGENT_FEATURE_GATE_ARG="--feature-gates=$REMAINING_GATES"
+  else
+    unset OTEL_AGENT_FEATURE_GATE_ARG
+  fi
+fi
+
+# Fall back to legacy schema when ClickHouse JSON exporter mode is enabled
+if [ "$HYPERDX_OTEL_EXPORTER_CLICKHOUSE_JSON_ENABLE" = "true" ]; then
+  export HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA=true
+fi
+
+# Run ClickHouse schema migrations if not using legacy schema creation
+if [ "$HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA" != "true" ]; then
+  # Run Go-based migrate tool with TLS support
+  # TLS configuration:
+  # - CLICKHOUSE_TLS_CA_FILE: CA certificate file
+  # - CLICKHOUSE_TLS_CERT_FILE: Client certificate file
+  # - CLICKHOUSE_TLS_KEY_FILE: Client private key file
+  # - CLICKHOUSE_TLS_SERVER_NAME_OVERRIDE: Server name for TLS verification
+  # - CLICKHOUSE_TLS_INSECURE_SKIP_VERIFY: Skip TLS verification (set to "true")
+  echo "🚀 Using Go-based migrate tool with TLS support 🔐"
+  migrate /etc/otel/schema/seed
+fi
+
+# Check if OPAMP_SERVER_URL is defined to determine mode
+if [ -z "$OPAMP_SERVER_URL" ]; then
+  # Standalone mode - run collector directly without supervisor
+  echo "Running in standalone mode (OPAMP_SERVER_URL not set)"
+
+  # Build collector arguments with multiple config files
+  COLLECTOR_ARGS="--config /etc/otelcol-contrib/config.yaml --config /etc/otelcol-contrib/standalone-config.yaml"
+
+  # Add OIDC-based bearer token auth config if OIDC_ISSUER_URL is specified,
+  # otherwise fall back to static bearer token auth if OTLP_AUTH_TOKEN is
+  # specified (only used in standalone mode). These are mutually exclusive:
+  # both configure the same receiver's auth.authenticator, so enabling both
+  # would just make whichever config file is loaded last win.
+  if [ -n "$OIDC_ISSUER_URL" ]; then
+    # oidcauthextension requires a non-empty audience unless ignore_audience
+    # is set (which we don't expose here, since silently skipping the
+    # audience check would weaken the auth rather than just fail loudly).
+    # Fail fast with a clear message instead of letting the collector crash
+    # on the extension's own less obvious "no audience provided" error.
+    if [ -z "$OIDC_AUDIENCE" ]; then
+      echo "ERROR: OIDC_ISSUER_URL is set but OIDC_AUDIENCE is not. Both are required to enable OIDC authentication." >&2
+      exit 1
+    fi
+    echo "OIDC_ISSUER_URL is configured, enabling OIDC-based bearer token authentication"
+    COLLECTOR_ARGS="$COLLECTOR_ARGS --config /etc/otelcol-contrib/standalone-oidc-config.yaml"
+  elif [ -n "$OTLP_AUTH_TOKEN" ]; then
+    echo "OTLP_AUTH_TOKEN is configured, enabling bearer token authentication"
+    COLLECTOR_ARGS="$COLLECTOR_ARGS --config /etc/otelcol-contrib/standalone-auth-config.yaml"
+  fi
+
+  # Enable prometheus remote-write of OTLP metrics only when an endpoint is
+  # configured. Mirrors the OpAMP-managed IS_PROMQL_ENABLED gating in
+  # packages/api/src/opamp/controllers/opampController.ts so the standalone
+  # collector does not attempt to export to a missing endpoint.
+  if [ -n "$CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT" ]; then
+    echo "CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT is set, enabling prometheus remote-write"
+    COLLECTOR_ARGS="$COLLECTOR_ARGS --config /etc/otelcol-contrib/standalone-promql-config.yaml"
+  fi
+
+  # Add custom config file if specified
+  if [ -n "$CUSTOM_OTELCOL_CONFIG_FILE" ]; then
+    echo "Including custom config: $CUSTOM_OTELCOL_CONFIG_FILE"
+    COLLECTOR_ARGS="$COLLECTOR_ARGS --config $CUSTOM_OTELCOL_CONFIG_FILE"
+  fi
+
+  # Pass remaining feature gates to the collector in standalone mode
+  if [ -n "$OTEL_AGENT_FEATURE_GATE_ARG" ]; then
+    COLLECTOR_ARGS="$COLLECTOR_ARGS $OTEL_AGENT_FEATURE_GATE_ARG"
+  fi
+
+  # Execute collector directly
+  exec /otelcontribcol $COLLECTOR_ARGS
+else
+  # Supervisor mode - run with OpAMP supervisor
+  echo "Running in supervisor mode (OPAMP_SERVER_URL: $OPAMP_SERVER_URL)"
+
+  # OTEL_SUPERVISOR_LOGS=true is consumed by supervisor.yaml.tmpl, which sets
+  # the supervisor's native `agent::passthrough_logs`. With this the supervisor
+  # forwards the collector's stdout/stderr through its own logger, keeping a
+  # single writer on the container's stdout.
+
+  # Render the supervisor config template using gomplate
+  # Write to supervisor-data directory which has proper permissions for otel user
+  gomplate -f /etc/otel/supervisor.yaml.tmpl -o /etc/otel/supervisor-data/supervisor-runtime.yaml
+
+  # Log the configuration being used
+  if [ -n "$CUSTOM_OTELCOL_CONFIG_FILE" ]; then
+      echo "Using custom OTEL config file: $CUSTOM_OTELCOL_CONFIG_FILE"
+  else
+      echo "CUSTOM_OTELCOL_CONFIG_FILE not set, using default configuration"
+  fi
+
+  # Update the command arguments to use the rendered config file
+  set -- "$1" --config /etc/otel/supervisor-data/supervisor-runtime.yaml
+
+  # Execute the supervisor with all passed arguments
+  exec "$@"
+fi

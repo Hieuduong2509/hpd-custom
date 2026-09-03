@@ -1,0 +1,24 @@
+# Tên "otel-collector-service" — theo đúng ví dụ bạn đưa ra cho quy tắc
+# wildcard domain: port 4318 không phải 80 nên URL public sẽ là
+# https://otel-collector-service--4318.sandbox.kamimind.ai/
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-service
+  namespace: sandbox
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: health
+      port: 13133
+      targetPort: 13133
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: metrics
+      port: 8888
+      targetPort: 8888

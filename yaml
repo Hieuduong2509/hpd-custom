@@ -1,0 +1,92 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: hyperdx-api
+  namespace: sandbox
+  uid: 10a96ccf-3e80-4964-9e3a-a36b427626bb
+  resourceVersion: '55781697'
+  generation: 8
+  creationTimestamp: '2026-08-16T15:53:02Z'
+  annotations:
+    deployment.kubernetes.io/revision: '8'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperdx-api
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: hyperdx-api
+    spec:
+      containers:
+        - name: api
+          image: docker.hyperdx.io/hyperdx/hyperdx:2
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HYPERDX_API_KEY
+              value: ''
+            - name: HYPERDX_API_PORT
+              value: '8000'
+            - name: HYPERDX_APP_PORT
+              value: '8080'
+            - name: FRONTEND_URL
+              value: https://hyperdx.sandbox.kamimind.ai
+            - name: SERVER_URL
+              value: http://hyperdx-api:8000
+            - name: HYPERDX_LOG_LEVEL
+              value: debug
+            - name: MONGO_URI
+              value: mongodb://db:27017/hyperdx
+            - name: OPAMP_PORT
+              value: '4320'
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector-service:4318
+            - name: OTEL_SERVICE_NAME
+              value: hdx-oss-app
+            - name: USAGE_STATS_ENABLED
+              value: 'true'
+            - name: CLICKHOUSE_HOST
+              value: http://ch-server:8123
+            - name: DEFAULT_CONNECTIONS
+              value: '[{"name":"Local ClickHouse","host":"http://ch-server:8123","username":"default","password":""}]'
+            - name: DEFAULT_SOURCES
+              value: '[{"from":{"databaseName":"default","tableName":"otel_logs"},"kind":"log","timestampValueExpression":"Timestamp","name":"Logs","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"Body","serviceNameExpression":"ServiceName","bodyExpression":"Body","eventAttributesExpression":"LogAttributes","resourceAttributesExpression":"ResourceAttributes","defaultTableSelectExpression":"Timestamp,ServiceName,SeverityText,Body","severityTextExpression":"SeverityText","traceIdExpression":"TraceId","spanIdExpression":"SpanId","connection":"Local ClickHouse","traceSourceId":"Traces","sessionSourceId":"Sessions","metricSourceId":"Metrics"},{"from":{"databaseName":"default","tableName":"otel_traces"},"kind":"trace","timestampValueExpression":"Timestamp","name":"Traces","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"SpanName","serviceNameExpression":"ServiceName","eventAttributesExpression":"SpanAttributes","resourceAttributesExpression":"ResourceAttributes","defaultTableSelectExpression":"Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName","traceIdExpression":"TraceId","spanIdExpression":"SpanId","durationExpression":"Duration","durationPrecision":9,"parentSpanIdExpression":"ParentSpanId","spanNameExpression":"SpanName","spanKindExpression":"SpanKind","statusCodeExpression":"StatusCode","statusMessageExpression":"StatusMessage","connection":"Local ClickHouse","logSourceId":"Logs","sessionSourceId":"Sessions","metricSourceId":"Metrics"}]'
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+status:
+  observedGeneration: 8
+  replicas: 1
+  updatedReplicas: 1
+  readyReplicas: 1
+  availableReplicas: 1
+  conditions:
+    - type: Available
+      status: 'True'
+      lastUpdateTime: '2026-08-17T03:08:59Z'
+      lastTransitionTime: '2026-08-17T03:08:59Z'
+      reason: MinimumReplicasAvailable
+      message: Deployment has minimum availability.
+    - type: Progressing
+      status: 'True'
+      lastUpdateTime: '2026-08-17T04:03:15Z'
+      lastTransitionTime: '2026-08-16T15:53:02Z'
+      reason: NewReplicaSetAvailable
+      message: ReplicaSet "hyperdx-api-747698d999" has successfully progressed.

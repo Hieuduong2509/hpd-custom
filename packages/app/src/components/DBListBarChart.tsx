@@ -1,0 +1,296 @@
+import { useMemo } from 'react';
+import Link from 'next/link';
+import { omit } from 'lodash';
+import { BuilderChartConfigWithDateRange } from '@hyperdx/common-utils/dist/types';
+import type { FloatingPosition } from '@mantine/core';
+import { Box, Flex, HoverCard, Text } from '@mantine/core';
+
+import { buildMVDateRangeIndicator } from '@/ChartUtils';
+import { useQueriedChartConfig } from '@/hooks/useChartConfig';
+import { useMVOptimizationExplanation } from '@/hooks/useMVOptimizationExplanation';
+import { useChartNumberFormats, useSource } from '@/source';
+import type { NumberFormat } from '@/types';
+import { formatNumber, semanticKeyedColor } from '@/utils';
+
+import ChartContainer from './charts/ChartContainer';
+import ChartErrorState, {
+  ChartErrorStateVariant,
+} from './charts/ChartErrorState';
+import MVOptimizationIndicator from './MaterializedViews/MVOptimizationIndicator';
+
+function ListItem({
+  title,
+  value,
+  color,
+  percent,
+  hoverCardContent,
+  hoverCardPosition = 'right',
+}: {
+  title: string;
+  value: string;
+  color: string;
+  percent: number;
+  hoverCardContent?: React.ReactNode;
+  hoverCardPosition?: FloatingPosition;
+}) {
+  const item = (
+    <Box>
+      <Flex justify="space-between">
+        <Text
+          size="sm"
+          style={{ overflowWrap: 'anywhere' }}
+          pr="xs"
+          lineClamp={2}
+        >
+          {title}
+        </Text>
+        <Text size="sm">{value}</Text>
+      </Flex>
+      <Box pt="xs">
+        <Box
+          style={{
+            width: `${percent}%`,
+            height: 8,
+            backgroundColor: color,
+            borderRadius: 4,
+          }}
+        />
+      </Box>
+    </Box>
+  );
+  return hoverCardContent ? (
+    <HoverCard
+      width={380}
+      shadow="md"
+      position={hoverCardPosition}
+      withinPortal
+    >
+      <HoverCard.Target>{item}</HoverCard.Target>
+      <HoverCard.Dropdown>{hoverCardContent}</HoverCard.Dropdown>
+    </HoverCard>
+  ) : (
+    item
+  );
+}
+
+function ListBar({
+  data,
+  valueColumn,
+  groupColumn,
+  getRowSearchLink,
+  columns,
+  hoverCardPosition,
+}: {
+  data: any[];
+  valueColumn: string;
+  groupColumn: string;
+  getRowSearchLink?: (row: any) => string;
+  columns: {
+    dataKey: string;
+    displayName: string;
+    numberFormat?: NumberFormat;
+    visible?: boolean;
+  }[];
+  hoverCardPosition?: FloatingPosition;
+}) {
+  const values = (data ?? []).map(row => row[valueColumn]);
+  const maxValue = Math.max(...values);
+  const totalValue = values.reduce((a, b) => a + b, 0);
+
+  return (
+    <>
+      {data?.map((row, index) => {
+        const value = row[valueColumn];
+        const percentOfMax = (value / maxValue) * 100;
+        const percentOfTotal = (value / totalValue) * 100;
+        const group = `${row[groupColumn] || 'N/A'}`;
+
+        const hoverCardContent =
+          columns.length > 0 ? (
+            <Box>
+              <Box mb="xs">
+                <Text
+                  size="xs"
+                  style={{ overflowWrap: 'anywhere' }}
+                  lineClamp={4}
+                >
+                  {group}
+                </Text>
+              </Box>
+              {columns
+                .filter(c => c.visible !== false && c.dataKey !== groupColumn)
+                .map(column => {
+                  const value = row[column.dataKey];
+                  return (
+                    <Box key={column.displayName}>
+                      <Text size="xs" fw={500} span>
+                        {column.displayName}:{' '}
+                      </Text>
+                      <Text size="xs" span>
+                        {column.numberFormat != null
+                          ? (formatNumber(value, column.numberFormat) ?? 'N/A')
+                          : value}
+                      </Text>
+                    </Box>
+                  );
+                })}
+            </Box>
+          ) : null;
+
+        return getRowSearchLink ? (
+          <Link href={getRowSearchLink(row)} key={group}>
+            <Box
+              mb="sm"
+              td="none"
+              className="cursor-pointer"
+              display="block"
+              c="inherit"
+            >
+              <ListItem
+                title={group}
+                value={`${percentOfTotal.toFixed(2)}%`}
+                color={semanticKeyedColor(group, index)}
+                percent={percentOfMax}
+                hoverCardContent={hoverCardContent}
+                hoverCardPosition={hoverCardPosition}
+              />
+            </Box>
+          </Link>
+        ) : (
+          <Box mb="sm" key={group}>
+            <ListItem
+              title={group}
+              value={`${percentOfTotal.toFixed(2)}%`}
+              color={semanticKeyedColor(group, index)}
+              percent={percentOfMax}
+              hoverCardContent={hoverCardContent}
+              hoverCardPosition={hoverCardPosition}
+            />
+          </Box>
+        );
+      })}
+    </>
+  );
+}
+
+export default function DBListBarChart({
+  config,
+  getRowSearchLink,
+  hoverCardPosition,
+  queryKeyPrefix,
+  enabled,
+  valueColumn,
+  groupColumn,
+  hiddenSeries,
+  title,
+  toolbarItems,
+  showMVOptimizationIndicator = true,
+  errorVariant,
+}: {
+  config: BuilderChartConfigWithDateRange;
+  onSettled?: () => void;
+  getRowSearchLink?: (row: any) => string;
+  hoverCardPosition?: FloatingPosition;
+  queryKeyPrefix?: string;
+  enabled?: boolean;
+  valueColumn: string;
+  groupColumn: string;
+  hiddenSeries?: string[];
+  title?: React.ReactNode;
+  toolbarItems?: React.ReactNode[];
+  showMVOptimizationIndicator?: boolean;
+  errorVariant?: ChartErrorStateVariant;
+}) {
+  const queriedConfig = omit(config, ['granularity']);
+  const { data, isLoading, isError, error } = useQueriedChartConfig(
+    queriedConfig,
+    {
+      placeholderData: (prev: any) => prev,
+      queryKey: [queryKeyPrefix, queriedConfig],
+      enabled,
+    },
+  );
+
+  const { data: mvOptimizationData } =
+    useMVOptimizationExplanation(queriedConfig);
+
+  const { data: source } = useSource({ id: config.source });
+
+  const { formatByColumn } = useChartNumberFormats(queriedConfig, data?.meta);
+
+  const columns = useMemo(() => {
+    const rows = data?.data ?? [];
+    if (rows.length === 0) {
+      return [];
+    }
+
+    return Object.keys(rows?.[0])
+      .filter(key => !hiddenSeries?.includes(key))
+      .map(key => ({
+        dataKey: key,
+        displayName: key,
+        numberFormat: formatByColumn.get(key) ?? queriedConfig.numberFormat,
+      }));
+  }, [data?.data, formatByColumn, hiddenSeries, queriedConfig.numberFormat]);
+
+  const toolbarItemsMemo = useMemo(() => {
+    const allToolbarItems = [];
+
+    if (source && showMVOptimizationIndicator) {
+      allToolbarItems.push(
+        <MVOptimizationIndicator
+          key="db-list-bar-chart-mv-indicator"
+          config={queriedConfig}
+          source={source}
+          variant="icon"
+        />,
+      );
+    }
+
+    const dateRangeIndicator = buildMVDateRangeIndicator({
+      mvOptimizationData,
+      originalDateRange: queriedConfig.dateRange,
+    });
+
+    if (dateRangeIndicator) {
+      allToolbarItems.push(dateRangeIndicator);
+    }
+
+    if (toolbarItems && toolbarItems.length > 0) {
+      allToolbarItems.push(...toolbarItems);
+    }
+
+    return allToolbarItems;
+  }, [
+    queriedConfig,
+    source,
+    toolbarItems,
+    showMVOptimizationIndicator,
+    mvOptimizationData,
+  ]);
+
+  return (
+    <ChartContainer title={title} toolbarItems={toolbarItemsMemo}>
+      {isLoading && !data ? (
+        <div className="d-flex h-100 w-100 align-items-center justify-content-center text-muted">
+          Loading Chart Data...
+        </div>
+      ) : isError ? (
+        <ChartErrorState error={error} variant={errorVariant} />
+      ) : data?.data.length === 0 ? (
+        <div className="d-flex h-100 w-100 align-items-center justify-content-center text-muted">
+          No data found within time range.
+        </div>
+      ) : (
+        <ListBar
+          data={data?.data ?? []}
+          columns={columns}
+          getRowSearchLink={getRowSearchLink}
+          hoverCardPosition={hoverCardPosition}
+          groupColumn={groupColumn}
+          valueColumn={valueColumn}
+        />
+      )}
+    </ChartContainer>
+  );
+}

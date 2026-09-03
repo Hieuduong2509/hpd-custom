@@ -1,0 +1,32 @@
+# Job dùng 1 LẦN để xoá sạch dữ liệu MongoDB (toàn bộ team/user/connection/
+# source/alert...) mà KHÔNG cần quyền delete PVC hay exec vào pod — chỉ cần
+# quyền Create. Dán file này qua nút Create trong Headlamp, đợi Job chạy
+# xong (status Completed), rồi có thể bỏ qua — không cần xoá Job đi.
+#
+# Sau khi chạy xong: MongoDB rỗng hoàn toàn, hyperdx-api sẽ quay lại màn
+# hình setup lần đầu (tạo team/admin mới) ở lần load tiếp theo.
+#
+# Muốn chạy lại lần 2: đổi metadata.name (vd. reset-mongodb-2) vì Job đã
+# chạy 1 lần không tạo lại được (không có quyền delete để xoá Job cũ).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reset-mongodb
+  namespace: sandbox
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: reset
+          image: mongo:5.0.14-focal
+          command:
+            - mongo
+            - --host
+            - db
+            - --port
+            - "27017"
+            - --eval
+            - "db.getSiblingDB('hyperdx').dropDatabase()"

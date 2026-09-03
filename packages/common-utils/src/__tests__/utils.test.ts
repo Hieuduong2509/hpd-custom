@@ -1,0 +1,3128 @@
+import { z } from 'zod';
+
+import {
+  aliasMapToWithClauses,
+  convertToCategoricalChartConfig,
+  convertToDashboardDocument,
+  convertToDashboardTemplate,
+  extractSettingsClauseFromEnd,
+  findJsonExpressions,
+  formatDate,
+  getAlignedDateRange,
+  getDistributedTableArgs,
+  getFirstOrderingItem,
+  hasNonEmptyOrderBy,
+  hasPositiveSeriesLimit,
+  isFirstOrderByAscending,
+  isJsonExpression,
+  isTimestampExpressionInFirstOrderBy,
+  joinQuerySettings,
+  optimizeTimestampValueExpression,
+  parseTokenizerFromTextIndex,
+  parseToNumber,
+  parseToStartOfFunction,
+  pickBucketTimestampColumn,
+  replaceJsonExpressions,
+  splitAndTrimCSV,
+  splitAndTrimWithBracket,
+} from '@/core/utils';
+import { isBuilderSavedChartConfig } from '@/guards';
+import {
+  BuilderChartConfigWithDateRange,
+  Connection,
+  DashboardSchema,
+  DashboardTemplateSchema,
+  MetricsDataType,
+  SourceKind,
+  TSource,
+} from '@/types';
+
+describe('utils', () => {
+  // Suppress expected console.error noise from invalid text index types,
+  // unknown tokenizers, and distributed table parsing edge cases
+  beforeAll(() => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterAll(() => {
+    jest.restoreAllMocks();
+  });
+
+  describe('formatDate', () => {
+    it('12h utc', () => {
+      const date = new Date('2021-01-01T12:00:00Z');
+      expect(
+        formatDate(date, {
+          clock: '12h',
+          isUTC: true,
+        }),
+      ).toEqual('Jan 1 12:00:00 PM');
+    });
+
+    it('24h utc', () => {
+      const date = new Date('2021-01-01T12:00:00Z');
+      expect(
+        formatDate(date, {
+          clock: '24h',
+          isUTC: true,
+          format: 'withMs',
+        }),
+      ).toEqual('Jan 1 12:00:00.000');
+    });
+
+    it('12h local', () => {
+      const date = new Date('2021-01-01T12:00:00');
+      expect(
+        formatDate(date, {
+          clock: '12h',
+          isUTC: false,
+        }),
+      ).toEqual('Jan 1 12:00:00 PM');
+    });
+
+    it('24h local', () => {
+      const date = new Date('2021-01-01T12:00:00');
+      expect(
+        formatDate(date, {
+          clock: '24h',
+          isUTC: false,
+          format: 'withMs',
+        }),
+      ).toEqual('Jan 1 12:00:00.000');
+    });
+  });
+
+  describe('splitAndTrimCSV', () => {
+    it('should split a comma-separated string and trim whitespace', () => {
+      expect(splitAndTrimCSV('a, b, c')).toEqual(['a', 'b', 'c']);
+    });
+
+    it('should handle strings with no spaces', () => {
+      expect(splitAndTrimCSV('a,b,c')).toEqual(['a', 'b', 'c']);
+    });
+
+    it('should filter out empty values', () => {
+      expect(splitAndTrimCSV('a,b,,c,')).toEqual(['a', 'b', 'c']);
+    });
+
+    it('should handle strings with extra whitespace', () => {
+      expect(splitAndTrimCSV('  a  ,  b  ,  c  ')).toEqual(['a', 'b', 'c']);
+    });
+
+    it('should return an empty array for an empty string', () => {
+      expect(splitAndTrimCSV('')).toEqual([]);
+    });
+
+    it('should handle a string with only commas and whitespace', () => {
+      expect(splitAndTrimCSV(',,  ,,')).toEqual([]);
+    });
+  });
+
+  describe('splitAndTrimWithBracket', () => {
+    it('should split a simple comma-separated string', () => {
+      const input = 'column1, column2, column3';
+      const expected = ['column1', 'column2', 'column3'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle function calls with commas in parameters', () => {
+      const input =
+        "Timestamp, ServiceName, JSONExtractString(Body, 'c'), JSONExtractString(Body, 'msg')";
+      const expected = [
+        'Timestamp',
+        'ServiceName',
+        "JSONExtractString(Body, 'c')",
+        "JSONExtractString(Body, 'msg')",
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle nested function calls', () => {
+      const input = 'col1, func1(a, b), col2, func2(c, func3(d, e)), col3';
+      const expected = [
+        'col1',
+        'func1(a, b)',
+        'col2',
+        'func2(c, func3(d, e))',
+        'col3',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle square brackets in column expressions', () => {
+      const input = "col1, array[1, 2, 3], jsonb_path_query(data, '$[*]')";
+      const expected = [
+        'col1',
+        'array[1, 2, 3]',
+        "jsonb_path_query(data, '$[*]')",
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle mixed parentheses and square brackets', () => {
+      const input = "col1, func(array[1, 2], obj['key']), col2['nested'][0]";
+      const expected = [
+        'col1',
+        "func(array[1, 2], obj['key'])",
+        "col2['nested'][0]",
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should trim whitespace from resulting columns', () => {
+      const input = '  col1  ,   func(a, b)  ,  col2  ';
+      const expected = ['col1', 'func(a, b)', 'col2'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle empty input', () => {
+      expect(splitAndTrimWithBracket('')).toEqual([]);
+    });
+
+    it('should handle input with only spaces', () => {
+      expect(splitAndTrimWithBracket('   ')).toEqual([]);
+    });
+
+    it('should skip empty elements', () => {
+      const input = 'col1,,col2, ,col3';
+      const expected = ['col1', 'col2', 'col3'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle quoted strings with commas', () => {
+      const input = "col1, concat('Hello, World!'), col2";
+      const expected = ['col1', "concat('Hello, World!')", 'col2'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle double quoted strings with commas', () => {
+      const input = 'col1, "quoted, string", col3';
+      const expected = ['col1', '"quoted, string"', 'col3'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle single quoted strings with commas', () => {
+      const input = `col1, 'quoted, string', col3`;
+      const expected = ['col1', `'quoted, string'`, 'col3'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should keep commas inside single-quoted strings with backslash-escaped quotes', () => {
+      const input = "'it\\'s,ok' AS label, count()";
+      const expected = ["'it\\'s,ok' AS label", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should keep commas inside double-quoted identifiers with escaped quotes', () => {
+      const input = '"foo\\"bar,baz" AS label, count()';
+      const expected = ['"foo\\"bar,baz" AS label', 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should keep commas inside single-quoted strings with doubled quotes', () => {
+      const input = "'it''s,ok' AS label, count()";
+      const expected = ["'it''s,ok' AS label", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should close strings after an even number of backslashes', () => {
+      const input = "'path\\\\', count()";
+      const expected = ["'path\\\\'", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle mixed quotes with commas', () => {
+      const input = `col1, "double, quoted", col2, 'single, quoted', col3`;
+      const expected = [
+        'col1',
+        `"double, quoted"`,
+        'col2',
+        `'single, quoted'`,
+        'col3',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle quotes inside function calls', () => {
+      const input = 'col1, func("text with , comma", \'another, text\'), col2';
+      const expected = [
+        'col1',
+        'func("text with , comma", \'another, text\')',
+        'col2',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle brackets inside quoted strings', () => {
+      const input =
+        'col1, "string with (brackets, inside)", col2, \'string with [brackets, inside]\', col3';
+      const expected = [
+        'col1',
+        '"string with (brackets, inside)"',
+        'col2',
+        "'string with [brackets, inside]'",
+        'col3',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle real-world SQL column list example', () => {
+      const input =
+        "Timestamp, ServiceName, JSONExtractString(Body, 'c'), JSONExtractString(Body, 'msg'), Timestamp, \"foo, bar\"";
+      const expected = [
+        'Timestamp',
+        'ServiceName',
+        "JSONExtractString(Body, 'c')",
+        "JSONExtractString(Body, 'msg')",
+        'Timestamp',
+        '"foo, bar"',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should handle order-by clauses with order directions', () => {
+      const input = 'toDate(Timestamp) ASC, Time ASC, ServiceName DESC';
+      const expected = [
+        'toDate(Timestamp) ASC',
+        'Time ASC',
+        'ServiceName DESC',
+      ];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+  });
+
+  describe('hasPositiveSeriesLimit', () => {
+    it('is true only for positive integers', () => {
+      expect(hasPositiveSeriesLimit(1)).toBe(true);
+      expect(hasPositiveSeriesLimit(250)).toBe(true);
+    });
+
+    it('is false for 0 (unlimited) and null/undefined (unset)', () => {
+      expect(hasPositiveSeriesLimit(0)).toBe(false);
+      expect(hasPositiveSeriesLimit(null)).toBe(false);
+      expect(hasPositiveSeriesLimit(undefined)).toBe(false);
+    });
+
+    it('is false for negative values', () => {
+      expect(hasPositiveSeriesLimit(-5)).toBe(false);
+    });
+  });
+
+  describe('convertToCategoricalChartConfig', () => {
+    const dateRange: [Date, Date] = [
+      new Date('2025-11-26T00:00:00Z'),
+      new Date('2025-11-27T00:00:00Z'),
+    ];
+
+    it('should remove granularity but keep groupBy', () => {
+      const config = {
+        granularity: '5 minute',
+        groupBy: 'ServiceName',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.granularity).toBeUndefined();
+      expect(convertedConfig.groupBy).toEqual('ServiceName');
+    });
+
+    it('should not inject a limit or orderBy when no seriesLimit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toBeUndefined();
+      expect(convertedConfig.limit).toBeUndefined();
+    });
+
+    it('should apply seriesLimit as a limit ordered by the first value descending', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.select[0]).toMatchObject({ alias: 'Value' });
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should order by the existing alias when the first series has one', () => {
+      const config = {
+        select: [
+          { aggFn: 'count', valueExpression: '', alias: 'Request "Count"' },
+        ],
+        groupBy: 'ServiceName',
+        seriesLimit: 3,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.select[0]).toMatchObject({
+        alias: 'Request "Count"',
+      });
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Request ""Count"""', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 3 });
+    });
+
+    it('should preserve a user-supplied string orderBy over the value-descending default when a limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: 'ServiceName ASC',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      // The user's explicit ORDER BY wins; the limit then keeps the top rows
+      // according to that ordering rather than the value-descending default.
+      expect(convertedConfig.orderBy).toEqual('ServiceName ASC');
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+      // The default value alias is only injected when we synthesize an
+      // ordering, so an untouched series keeps no alias.
+      expect(convertedConfig.select[0]).not.toHaveProperty('alias');
+    });
+
+    it('should preserve a user-supplied array orderBy over the value-descending default when a limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: [
+          { valueExpression: 'ServiceName', ordering: 'DESC' as const },
+        ],
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: 'ServiceName', ordering: 'DESC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should preserve a user-supplied orderBy even when no limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        orderBy: 'ServiceName ASC',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual('ServiceName ASC');
+      expect(convertedConfig.limit).toBeUndefined();
+    });
+
+    it('should inject the value-descending default when the user orderBy is an empty string', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: '',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should inject the value-descending ordering for ratio configs too', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        seriesReturnType: 'ratio',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should preserve an explicit limit over seriesLimit', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        limit: { limit: 2 },
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.limit).toEqual({ limit: 2 });
+    });
+
+    it('should not inject an orderBy when there is no groupBy', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toBeUndefined();
+    });
+
+    it('should not mutate the input config', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      convertToCategoricalChartConfig(config);
+
+      expect(config.select[0]).not.toHaveProperty('alias');
+      expect(config.orderBy).toBeUndefined();
+      expect(config.limit).toBeUndefined();
+    });
+  });
+
+  describe('hasCategoricalUserOrderBy', () => {
+    it('returns false for undefined', () => {
+      expect(hasNonEmptyOrderBy(undefined)).toBe(false);
+    });
+
+    it('returns false for null', () => {
+      expect(hasNonEmptyOrderBy(null)).toBe(false);
+    });
+
+    it('returns false for an empty string', () => {
+      expect(hasNonEmptyOrderBy('')).toBe(false);
+    });
+
+    it('returns false for a whitespace-only string', () => {
+      expect(hasNonEmptyOrderBy('   ')).toBe(false);
+    });
+
+    it('returns true for a non-empty string', () => {
+      expect(hasNonEmptyOrderBy('ServiceName ASC')).toBe(true);
+    });
+
+    it('returns false for an empty array', () => {
+      expect(hasNonEmptyOrderBy([])).toBe(false);
+    });
+
+    it('returns true for a non-empty array of sort specifications', () => {
+      expect(
+        hasNonEmptyOrderBy([
+          { valueExpression: 'ServiceName', ordering: 'DESC' },
+        ]),
+      ).toBe(true);
+    });
+  });
+
+  describe('getFirstOrderingItem', () => {
+    it('should return undefined for undefined input', () => {
+      expect(getFirstOrderingItem(undefined)).toBeUndefined();
+    });
+
+    it('should return the first column name for a single column string input', () => {
+      expect(getFirstOrderingItem('column1 DESC')).toBe('column1 DESC');
+    });
+
+    it('should return the first column name for a simple string input', () => {
+      expect(getFirstOrderingItem('column1, column2 DESC, column3 ASC')).toBe(
+        'column1',
+      );
+    });
+
+    it('should return the first column name for a simple string input', () => {
+      expect(
+        getFirstOrderingItem('column1 ASC, column2 DESC, column3 ASC'),
+      ).toBe('column1 ASC');
+    });
+
+    it('should return the first column name for an array of objects input', () => {
+      const orderBy: Exclude<
+        BuilderChartConfigWithDateRange['orderBy'],
+        string
+      > = [
+        { valueExpression: 'column1', ordering: 'ASC' },
+        { valueExpression: 'column2', ordering: 'ASC' },
+      ];
+      expect(getFirstOrderingItem(orderBy)).toEqual({
+        valueExpression: 'column1',
+        ordering: 'ASC',
+      });
+    });
+  });
+
+  describe('isFirstOrderingOnTimestampExpression', () => {
+    it('should return false if no orderBy is provided', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: undefined,
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(false);
+    });
+
+    it('should return false if empty orderBy is provided', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: '',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(false);
+    });
+
+    it('should return false if the first ordering column is not in the timestampValueExpression', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: 'ServiceName',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(false);
+    });
+
+    it('should return false if the second ordering column is in the timestampValueExpression but the first is not', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: 'ServiceName ASC, Timestamp',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(false);
+    });
+
+    it('should return true if the first ordering column is the timestampValueExpression', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: 'Timestamp',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should return true if the first ordering column is a string and has a direction', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: 'Timestamp DESC, ServiceName',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should return true if the first ordering column is a string and has a lowercase direction', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: 'Timestamp desc, ServiceName',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should return true if the first ordering column is an object and is in the timestampValueExpression', () => {
+      const config = {
+        timestampValueExpression: 'Timestamp',
+        orderBy: [
+          { valueExpression: 'Timestamp', ordering: 'ASC' },
+          { valueExpression: 'ServiceName', ordering: 'ASC' },
+        ],
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should support toStartOf() timestampValueExpressions', () => {
+      const config = {
+        timestampValueExpression: 'toStartOfDay(Timestamp), Timestamp',
+        orderBy: '(toStartOfDay(Timestamp)) DESC, Timestamp',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should support toStartOf() timestampValueExpressions in tuples', () => {
+      const config = {
+        timestampValueExpression: 'toStartOfDay(Timestamp), Timestamp',
+        orderBy: '(toStartOfHour(TimestampTime), TimestampTime) DESC',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+
+    it('should support functions with multiple parameters in the order by', () => {
+      const config = {
+        timestampValueExpression:
+          'toStartOfInterval(TimestampTime, INTERVAL 1 DAY)',
+        orderBy: 'toStartOfInterval(TimestampTime, INTERVAL 1 DAY) DESC',
+      } as BuilderChartConfigWithDateRange;
+
+      expect(isTimestampExpressionInFirstOrderBy(config)).toBe(true);
+    });
+  });
+
+  describe('isFirstOrderingAscending', () => {
+    it('should return true for ascending order in string input', () => {
+      expect(isFirstOrderByAscending('column1 ASC, column2 DESC')).toBe(true);
+    });
+
+    it('should return true for lowercase, non-trimmed ascending order in string input', () => {
+      expect(isFirstOrderByAscending(' column1 asc , column2 DESC')).toBe(true);
+    });
+
+    it('should return true for ascending order without explicit direction in string input', () => {
+      expect(isFirstOrderByAscending('column1, column2 DESC')).toBe(true);
+    });
+
+    it('should return false for descending order in string input', () => {
+      expect(isFirstOrderByAscending('column1 DESC, column2 ASC')).toBe(false);
+    });
+
+    it('should return false for lowercase, non-trimmed descending order in string input', () => {
+      expect(isFirstOrderByAscending(' column1 desc , column2 ASC')).toBe(
+        false,
+      );
+    });
+
+    it('should return true for ascending order in object input', () => {
+      const orderBy: Exclude<
+        BuilderChartConfigWithDateRange['orderBy'],
+        string
+      > = [
+        { valueExpression: 'column1', ordering: 'ASC' },
+        { valueExpression: 'column2', ordering: 'DESC' },
+      ];
+      expect(isFirstOrderByAscending(orderBy)).toBe(true);
+    });
+
+    it('should return false for descending order in object input', () => {
+      const orderBy: Exclude<
+        BuilderChartConfigWithDateRange['orderBy'],
+        string
+      > = [
+        { valueExpression: 'column1', ordering: 'DESC' },
+        { valueExpression: 'column2', ordering: 'ASC' },
+      ];
+      expect(isFirstOrderByAscending(orderBy)).toBe(false);
+    });
+
+    it('should return false if no orderBy is provided', () => {
+      expect(isFirstOrderByAscending(undefined)).toBe(false);
+    });
+
+    it('should support toStartOf() timestampValueExpressions in tuples', () => {
+      const orderBy = '(toStartOfHour(TimestampTime), TimestampTime) DESC';
+      expect(isFirstOrderByAscending(orderBy)).toBe(false);
+    });
+
+    it('should support toStartOf() timestampValueExpressions in tuples', () => {
+      const orderBy = '(toStartOfHour(TimestampTime), TimestampTime) ASC';
+      expect(isFirstOrderByAscending(orderBy)).toBe(true);
+    });
+  });
+
+  describe('convertToDashboardTemplate', () => {
+    it('should convert a dashboard to a dashboard template', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'My Dashboard',
+        tags: ['tag1', 'tag2'],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'source1',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'Metric Tile',
+              source: 'source2',
+              select: '',
+              where: '',
+            },
+            x: 6,
+            y: 6,
+            w: 6,
+            h: 6,
+          },
+        ],
+        filters: [
+          {
+            id: 'filter1',
+            type: 'QUERY_EXPRESSION',
+            name: 'SeverityFilter',
+            expression: 'Severity',
+            source: 'source1',
+          },
+          {
+            id: 'filter2',
+            type: 'QUERY_EXPRESSION',
+            name: 'ServiceNameFilter',
+            expression: 'ServiceName',
+            source: 'source2',
+            sourceMetricType: MetricsDataType.Gauge,
+          },
+        ],
+      };
+
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: {
+            databaseName: 'db1',
+            tableName: 'logs_table',
+          },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+        {
+          id: 'source2',
+          name: 'Metrics',
+          connection: 'connection1',
+          kind: SourceKind.Metric,
+          from: {
+            databaseName: 'db1',
+            tableName: '',
+          },
+          metricTables: {
+            gauge: 'gauge_table',
+            sum: 'sum_table',
+            histogram: 'histogram_table',
+            'exponential histogram': '',
+            summary: '',
+          },
+          timestampValueExpression: 'Timestamp',
+          resourceAttributesExpression: 'ResourceAttributes',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+      expect(template).toEqual({
+        name: 'My Dashboard',
+        version: '0.1.0',
+        tags: ['tag1', 'tag2'],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'Logs',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'Metric Tile',
+              source: 'Metrics',
+              select: '',
+              where: '',
+            },
+            x: 6,
+            y: 6,
+            w: 6,
+            h: 6,
+          },
+        ],
+        filters: [
+          {
+            id: 'filter1',
+            type: 'QUERY_EXPRESSION',
+            name: 'SeverityFilter',
+            expression: 'Severity',
+            source: 'Logs',
+          },
+          {
+            id: 'filter2',
+            type: 'QUERY_EXPRESSION',
+            name: 'ServiceNameFilter',
+            expression: 'ServiceName',
+            source: 'Metrics',
+            sourceMetricType: MetricsDataType.Gauge,
+          },
+        ],
+      });
+    });
+
+    it('should include saved default query and filter values in the template', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Dashboard With Defaults',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'source1',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+        savedQuery: 'level:error',
+        savedQueryLanguage: 'lucene',
+        savedFilterValues: [
+          {
+            type: 'lucene',
+            condition: 'ServiceName:"accounting"',
+          },
+        ],
+      };
+
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: {
+            databaseName: 'db1',
+            tableName: 'logs_table',
+          },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.savedQuery).toBe('level:error');
+      expect(template.savedQueryLanguage).toBe('lucene');
+      expect(template.savedFilterValues).toEqual([
+        { type: 'lucene', condition: 'ServiceName:"accounting"' },
+      ]);
+
+      const document = convertToDashboardDocument(template);
+      expect(document.savedQuery).toBe('level:error');
+      expect(document.savedQueryLanguage).toBe('lucene');
+      expect(document.savedFilterValues).toEqual([
+        { type: 'lucene', condition: 'ServiceName:"accounting"' },
+      ]);
+    });
+
+    describe('savedFilterValues export/import round trip', () => {
+      const baseSources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'logs_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const makeDashboard = (
+        savedFilterValues?: z.infer<
+          typeof DashboardSchema
+        >['savedFilterValues'],
+      ): z.infer<typeof DashboardSchema> => ({
+        id: 'dashboard1',
+        name: 'Service Filter Dashboard',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'source1',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+        filters: [
+          {
+            id: 'filter1',
+            type: 'QUERY_EXPRESSION',
+            name: 'ServiceName Filter',
+            expression: 'ServiceName',
+            source: 'source1',
+          },
+        ],
+        ...(savedFilterValues !== undefined ? { savedFilterValues } : {}),
+      });
+
+      it('omits savedFilterValues when no services are selected (undefined)', () => {
+        const dashboard = makeDashboard(undefined);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).toBeUndefined();
+        expect('savedFilterValues' in template).toBe(false);
+
+        const document = convertToDashboardDocument(template);
+        expect(document.savedFilterValues).toBeUndefined();
+        expect('savedFilterValues' in document).toBe(false);
+      });
+
+      it('omits savedFilterValues when the selection is an empty array', () => {
+        const dashboard = makeDashboard([]);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).toBeUndefined();
+        expect('savedFilterValues' in template).toBe(false);
+
+        const document = convertToDashboardDocument(template);
+        expect(document.savedFilterValues).toBeUndefined();
+        expect('savedFilterValues' in document).toBe(false);
+      });
+
+      it('carries a single selected service through the round trip', () => {
+        const savedFilterValues = [
+          {
+            type: 'lucene' as const,
+            condition: 'ServiceName:"hdx-oss-dev-api"',
+          },
+        ];
+        const dashboard = makeDashboard(savedFilterValues);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).toEqual(savedFilterValues);
+
+        const document = convertToDashboardDocument(template);
+        expect(document.savedFilterValues).toEqual(savedFilterValues);
+      });
+
+      it('carries multiple selected services through the round trip', () => {
+        const savedFilterValues = [
+          {
+            type: 'lucene' as const,
+            condition:
+              '(ServiceName:"hdx-oss-dev-api" OR ServiceName:"hdx-oss-dev-app")',
+          },
+        ];
+        const dashboard = makeDashboard(savedFilterValues);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).toEqual(savedFilterValues);
+
+        const document = convertToDashboardDocument(template);
+        expect(document.savedFilterValues).toEqual(savedFilterValues);
+      });
+
+      it('carries selected values across multiple filter expressions', () => {
+        const savedFilterValues = [
+          {
+            type: 'lucene' as const,
+            condition:
+              '(ServiceName:"hdx-oss-dev-api" OR ServiceName:"hdx-oss-dev-app")',
+          },
+          { type: 'lucene' as const, condition: 'SeverityText:"error"' },
+        ];
+        const dashboard = makeDashboard(savedFilterValues);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).toEqual(savedFilterValues);
+
+        const document = convertToDashboardDocument(template);
+        expect(document.savedFilterValues).toEqual(savedFilterValues);
+      });
+
+      it('deep-clones savedFilterValues so the template does not alias the input', () => {
+        const savedFilterValues = [
+          {
+            type: 'lucene' as const,
+            condition: 'ServiceName:"hdx-oss-dev-api"',
+          },
+        ];
+        const dashboard = makeDashboard(savedFilterValues);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(template.savedFilterValues).not.toBe(
+          dashboard.savedFilterValues,
+        );
+        expect(template.savedFilterValues?.[0]).not.toBe(savedFilterValues[0]);
+
+        // Mutating the source after export must not leak into the template.
+        savedFilterValues[0].condition = 'ServiceName:"mutated"';
+        const exported = template.savedFilterValues?.[0];
+        expect(exported).toEqual({
+          type: 'lucene',
+          condition: 'ServiceName:"hdx-oss-dev-api"',
+        });
+      });
+
+      it('produces a template that validates against DashboardTemplateSchema', () => {
+        const dashboard = makeDashboard([
+          {
+            type: 'lucene' as const,
+            condition: 'ServiceName:"hdx-oss-dev-api"',
+          },
+        ]);
+
+        const template = convertToDashboardTemplate(dashboard, baseSources);
+        expect(() => DashboardTemplateSchema.parse(template)).not.toThrow();
+      });
+    });
+
+    it('should remap filter.appliesToSourceIds from IDs to names', () => {
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'logs_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+        {
+          id: 'source2',
+          name: 'Traces',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'traces_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Mixed-Source Dashboard',
+        tags: [],
+        tiles: [],
+        filters: [
+          {
+            // Multi-source scope — every ID resolves; both become names.
+            id: 'filter-multi',
+            type: 'QUERY_EXPRESSION',
+            name: 'Service',
+            expression: 'ServiceName',
+            source: 'source1',
+            appliesToSourceIds: ['source1', 'source2'],
+          },
+          {
+            // Mixed: one resolvable + one stale ID. Stale ID is dropped
+            // silently so the surviving names land in the template.
+            id: 'filter-partial',
+            type: 'QUERY_EXPRESSION',
+            name: 'Region',
+            expression: 'Region',
+            source: 'source1',
+            appliesToSourceIds: ['source1', 'deleted-source-id'],
+          },
+          {
+            // Every ID is stale → the array would be empty, which would
+            // import as "no tiles match". Field is omitted instead so the
+            // template imports as broadcast-to-all (safer default).
+            id: 'filter-all-unresolved',
+            type: 'QUERY_EXPRESSION',
+            name: 'Cluster',
+            expression: 'Cluster',
+            source: 'source1',
+            appliesToSourceIds: ['deleted-source-id'],
+          },
+          {
+            // Unscoped filter (field omitted in the source doc) must stay
+            // unscoped — no array gets materialized in the template.
+            id: 'filter-broadcast',
+            type: 'QUERY_EXPRESSION',
+            name: 'Env',
+            expression: 'Env',
+            source: 'source1',
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.filters).toEqual([
+        {
+          id: 'filter-multi',
+          type: 'QUERY_EXPRESSION',
+          name: 'Service',
+          expression: 'ServiceName',
+          source: 'Logs',
+          appliesToSourceIds: ['Logs', 'Traces'],
+        },
+        {
+          id: 'filter-partial',
+          type: 'QUERY_EXPRESSION',
+          name: 'Region',
+          expression: 'Region',
+          source: 'Logs',
+          appliesToSourceIds: ['Logs'],
+        },
+        {
+          id: 'filter-all-unresolved',
+          type: 'QUERY_EXPRESSION',
+          name: 'Cluster',
+          expression: 'Cluster',
+          source: 'Logs',
+          // appliesToSourceIds intentionally absent — empty result is
+          // collapsed to undefined so the import treats it as broadcast.
+        },
+        {
+          id: 'filter-broadcast',
+          type: 'QUERY_EXPRESSION',
+          name: 'Env',
+          expression: 'Env',
+          source: 'Logs',
+        },
+      ]);
+      expect(template.filters?.[2].appliesToSourceIds).toBeUndefined();
+      expect(template.filters?.[3].appliesToSourceIds).toBeUndefined();
+    });
+
+    // Variable settings are dashboard-local — unlike `source` and
+    // `appliesToSourceIds` they reference nothing in the workspace, so they need
+    // no name↔ID remapping and must survive export verbatim.
+    it('should export filter variable settings unchanged while still remapping sources', () => {
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'logs_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Variables Dashboard',
+        tags: [],
+        tiles: [],
+        filters: [
+          {
+            id: 'filter-variable',
+            type: 'QUERY_EXPRESSION',
+            name: 'Service Name',
+            expression: 'ServiceName',
+            source: 'source1',
+            appliesToSourceIds: ['source1'],
+            isBroadcastEnabled: false,
+            isVariableEnabled: true,
+            variableName: 'Service_Name',
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.filters).toEqual([
+        {
+          id: 'filter-variable',
+          type: 'QUERY_EXPRESSION',
+          name: 'Service Name',
+          expression: 'ServiceName',
+          source: 'Logs',
+          appliesToSourceIds: ['Logs'],
+          isBroadcastEnabled: false,
+          isVariableEnabled: true,
+          variableName: 'Service_Name',
+        },
+      ]);
+    });
+
+    it('should convert a dashboard without filters to a dashboard template', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'My Dashboard',
+        tags: ['tag1', 'tag2'],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'source1',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'Metric Tile',
+              source: 'source2',
+              select: '',
+              where: '',
+            },
+            x: 6,
+            y: 6,
+            w: 6,
+            h: 6,
+          },
+        ],
+      };
+
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: {
+            databaseName: 'db1',
+            tableName: 'logs_table',
+          },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+        {
+          id: 'source2',
+          name: 'Metrics',
+          connection: 'connection1',
+          kind: SourceKind.Metric,
+          from: {
+            databaseName: 'db1',
+            tableName: '',
+          },
+          metricTables: {
+            gauge: 'gauge_table',
+            sum: 'sum_table',
+            histogram: 'histogram_table',
+            'exponential histogram': '',
+            summary: '',
+          },
+          timestampValueExpression: 'Timestamp',
+          resourceAttributesExpression: 'ResourceAttributes',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+      expect(template).toEqual({
+        name: 'My Dashboard',
+        version: '0.1.0',
+        tags: ['tag1', 'tag2'],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'Log Tile',
+              source: 'Logs',
+              select: '',
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'Metric Tile',
+              source: 'Metrics',
+              select: '',
+              where: '',
+            },
+            x: 6,
+            y: 6,
+            w: 6,
+            h: 6,
+          },
+        ],
+      });
+    });
+
+    it('should preserve level property for quantile aggFn in select', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Quantile Dashboard',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'P95 Latency',
+              source: 'source1',
+              select: [
+                {
+                  aggFn: 'quantile',
+                  level: 0.95,
+                  aggCondition: '',
+                  aggConditionLanguage: 'lucene',
+                  valueExpression: 'Duration',
+                },
+              ],
+              where: '',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+      };
+
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: {
+            databaseName: 'db1',
+            tableName: 'logs_table',
+          },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+      const tileConfig = template.tiles[0].config;
+      if (!isBuilderSavedChartConfig(tileConfig))
+        throw new Error('Expected builder config');
+      const selectList = tileConfig.select;
+      expect(Array.isArray(selectList)).toBe(true);
+      expect((selectList as any[])[0]).toMatchObject({
+        aggFn: 'quantile',
+        level: 0.95,
+      });
+    });
+
+    it('should convert connection IDs to names for RawSQL tiles', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'SQL Dashboard',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'SQL Tile',
+              configType: 'sql',
+              sqlTemplate: 'SELECT 1',
+              connection: 'conn1',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'Another SQL Tile',
+              configType: 'sql',
+              sqlTemplate: 'SELECT 2',
+              connection: 'conn2',
+            },
+            x: 6,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+      };
+
+      const connections: Connection[] = [
+        {
+          id: 'conn1',
+          name: 'Production DB',
+          host: 'http://localhost:8123',
+          username: 'default',
+        },
+        {
+          id: 'conn2',
+          name: 'Staging DB',
+          host: 'http://localhost:8124',
+          username: 'default',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(dashboard, [], connections);
+      expect(template.tiles[0].config).toMatchObject({
+        configType: 'sql',
+        connection: 'Production DB',
+      });
+      expect(template.tiles[1].config).toMatchObject({
+        configType: 'sql',
+        connection: 'Staging DB',
+      });
+    });
+
+    it('should convert source IDs to names for RawSQL tiles with a source', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'SQL Dashboard',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'SQL Tile With Source',
+              configType: 'sql',
+              sqlTemplate: 'SELECT 1',
+              connection: 'conn1',
+              source: 'source1',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+          {
+            id: 'tile2',
+            config: {
+              name: 'SQL Tile Without Source',
+              configType: 'sql',
+              sqlTemplate: 'SELECT 2',
+              connection: 'conn1',
+            },
+            x: 6,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+      };
+
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          kind: SourceKind.Log,
+          name: 'My Logs',
+          from: { databaseName: 'default', tableName: 'otel_logs' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+          connection: 'conn1',
+        },
+      ];
+
+      const connections: Connection[] = [
+        {
+          id: 'conn1',
+          name: 'Production DB',
+          host: 'http://localhost:8123',
+          username: 'default',
+        },
+      ];
+
+      const template = convertToDashboardTemplate(
+        dashboard,
+        sources,
+        connections,
+      );
+      expect(template.tiles[0].config).toMatchObject({
+        configType: 'sql',
+        connection: 'Production DB',
+        source: 'My Logs',
+      });
+      // Tile without source should not have source set
+      expect(template.tiles[1].config).toMatchObject({
+        configType: 'sql',
+        connection: 'Production DB',
+      });
+      expect(
+        (template.tiles[1].config as { source?: string }).source,
+      ).toBeUndefined();
+    });
+
+    it('should fall back to empty string for unknown connection IDs in RawSQL tiles', () => {
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'SQL Dashboard',
+        tags: [],
+        tiles: [
+          {
+            id: 'tile1',
+            config: {
+              name: 'SQL Tile',
+              configType: 'sql',
+              sqlTemplate: 'SELECT 1',
+              connection: 'unknown-conn',
+            },
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, [], []);
+      expect(template.tiles[0].config).toMatchObject({
+        configType: 'sql',
+        connection: '',
+      });
+    });
+
+    describe('onClick id-mode target rewriting', () => {
+      const source: TSource = {
+        id: 'source1',
+        name: 'Logs',
+        connection: 'conn1',
+        kind: SourceKind.Log,
+        from: { databaseName: 'db1', tableName: 'logs_table' },
+        timestampValueExpression: 'Timestamp',
+        defaultTableSelectExpression: '',
+      };
+
+      const makeDashboard = (
+        onClick: unknown,
+      ): z.infer<typeof DashboardSchema> =>
+        DashboardSchema.parse({
+          id: 'dashboard1',
+          name: 'My Dashboard',
+          tags: [],
+          tiles: [
+            {
+              id: 'tile1',
+              config: {
+                name: 'Table Tile',
+                source: 'source1',
+                select: '',
+                where: '',
+                ...(onClick != null ? { onClick } : {}),
+              },
+              x: 0,
+              y: 0,
+              w: 6,
+              h: 6,
+            },
+          ],
+        });
+
+      it('rewrites a search onClick id to the source name', () => {
+        const dashboard = makeDashboard({
+          type: 'search',
+          target: { mode: 'id', id: 'source1' },
+          whereLanguage: 'sql',
+        });
+
+        const template = convertToDashboardTemplate(dashboard, [source]);
+
+        expect(template.tiles[0].config).toMatchObject({
+          onClick: {
+            type: 'search',
+            target: { mode: 'id', id: 'Logs' },
+            whereLanguage: 'sql',
+          },
+        });
+      });
+
+      it('rewrites a dashboard onClick id to the dashboard name', () => {
+        const dashboard = makeDashboard({
+          type: 'dashboard',
+          target: { mode: 'id', id: 'target-dash-id' },
+          whereLanguage: 'lucene',
+        });
+
+        const template = convertToDashboardTemplate(
+          dashboard,
+          [source],
+          [],
+          [{ id: 'target-dash-id', name: 'Ops Overview' }],
+        );
+
+        expect(template.tiles[0].config).toMatchObject({
+          onClick: {
+            type: 'dashboard',
+            target: { mode: 'id', id: 'Ops Overview' },
+            whereLanguage: 'lucene',
+          },
+        });
+      });
+
+      it('leaves template-mode onClick targets untouched', () => {
+        const dashboard = makeDashboard({
+          type: 'search',
+          target: { mode: 'template', template: '{{Src}}' },
+          whereLanguage: 'sql',
+        });
+
+        const template = convertToDashboardTemplate(dashboard, [source]);
+
+        expect(template.tiles[0].config).toMatchObject({
+          onClick: {
+            type: 'search',
+            target: { mode: 'template', template: '{{Src}}' },
+            whereLanguage: 'sql',
+          },
+        });
+      });
+
+      it('leaves an external onClick untouched (no source mapping)', () => {
+        const dashboard = makeDashboard({
+          type: 'external',
+          urlTemplate: 'https://grafana.example.com/d/abc?svc={{ServiceName}}',
+        });
+
+        const template = convertToDashboardTemplate(dashboard, [source]);
+
+        expect(template.tiles[0].config).toMatchObject({
+          onClick: {
+            type: 'external',
+            urlTemplate:
+              'https://grafana.example.com/d/abc?svc={{ServiceName}}',
+          },
+        });
+      });
+
+      it('drops a search onClick whose source was deleted', () => {
+        const dashboard = makeDashboard({
+          type: 'search',
+          target: { mode: 'id', id: 'missing-source' },
+          whereLanguage: 'sql',
+        });
+
+        const template = convertToDashboardTemplate(dashboard, [source]);
+
+        expect(
+          (template.tiles[0].config as { onClick?: unknown }).onClick,
+        ).toBeUndefined();
+      });
+
+      it('drops a dashboard onClick whose dashboard was deleted', () => {
+        const dashboard = makeDashboard({
+          type: 'dashboard',
+          target: { mode: 'id', id: 'missing-dash' },
+          whereLanguage: 'sql',
+        });
+
+        const template = convertToDashboardTemplate(
+          dashboard,
+          [source],
+          [],
+          [{ id: 'other-dash', name: 'Other' }],
+        );
+
+        expect(
+          (template.tiles[0].config as { onClick?: unknown }).onClick,
+        ).toBeUndefined();
+      });
+    });
+  });
+
+  describe('DashboardTemplateSchema duplicate tile IDs', () => {
+    const makeTemplateTile = (id: string) => ({
+      id,
+      x: 0,
+      y: 0,
+      w: 6,
+      h: 4,
+      config: {
+        name: `Tile ${id}`,
+        source: 'source1',
+        displayType: 'number',
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        where: '',
+        whereLanguage: 'sql',
+      },
+    });
+
+    it('accepts tiles with unique IDs', () => {
+      const template = {
+        version: '0.1.0',
+        name: 'Unique Tiles',
+        tiles: [
+          makeTemplateTile('tile-a'),
+          makeTemplateTile('tile-b'),
+          makeTemplateTile('tile-c'),
+        ],
+      };
+      expect(() => DashboardTemplateSchema.parse(template)).not.toThrow();
+    });
+
+    it('rejects tiles with duplicate IDs and surfaces the duplicate ID', () => {
+      const template = {
+        version: '0.1.0',
+        name: 'Duplicate Tiles',
+        tiles: [
+          makeTemplateTile('dup'),
+          makeTemplateTile('unique'),
+          makeTemplateTile('dup'),
+        ],
+      };
+
+      const result = DashboardTemplateSchema.safeParse(template);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message);
+        expect(messages).toContain('Duplicate tile ID: dup');
+      }
+    });
+  });
+
+  describe('isJsonExpression', () => {
+    it('should return false for expressions without dots', () => {
+      expect(isJsonExpression('col')).toBe(false);
+      expect(isJsonExpression('columnName')).toBe(false);
+      expect(isJsonExpression('column_name')).toBe(false);
+    });
+
+    it('should return true for simple JSON expressions', () => {
+      expect(isJsonExpression('col.key')).toBe(true);
+      expect(isJsonExpression('column.property')).toBe(true);
+    });
+
+    it('should return true for nested JSON expressions', () => {
+      expect(isJsonExpression('col.key.nestedKey')).toBe(true);
+      expect(isJsonExpression('a.b.c')).toBe(true);
+      expect(isJsonExpression('json_col.col3.c')).toBe(true);
+    });
+
+    it('should return true for JSON expressions with double quotes', () => {
+      expect(isJsonExpression('"json_col"."key"')).toBe(true);
+      expect(isJsonExpression('"a"."b"."cde"')).toBe(true);
+      expect(isJsonExpression('"a_b.2c".b."c."')).toBe(true);
+    });
+
+    it('should return true for JSON expressions with backticks', () => {
+      expect(isJsonExpression('`a`.`b`.`cde`')).toBe(true);
+      expect(isJsonExpression('`col`.`key`')).toBe(true);
+    });
+
+    it('should return true for mixed quoting styles', () => {
+      expect(isJsonExpression('"a".b.`c`')).toBe(true);
+      expect(isJsonExpression('a."b".c')).toBe(true);
+    });
+
+    it('should return false for expressions with only one non-numeric part', () => {
+      expect(isJsonExpression('col.')).toBe(false);
+      expect(isJsonExpression('.col')).toBe(false);
+    });
+
+    it('should return false for decimal numbers', () => {
+      expect(isJsonExpression('10.50')).toBe(false);
+      expect(isJsonExpression('2.3')).toBe(false);
+      expect(isJsonExpression('1.5')).toBe(false);
+    });
+
+    it('should return false for table.column references with numeric column', () => {
+      expect(isJsonExpression('table.1')).toBe(false);
+    });
+
+    it('should return false for expressions with empty parts', () => {
+      expect(isJsonExpression('.')).toBe(false);
+      expect(isJsonExpression('..')).toBe(false);
+      expect(isJsonExpression('a..')).toBe(false);
+    });
+
+    it('should handle dots inside double quotes correctly', () => {
+      expect(isJsonExpression('"a.b.c"')).toBe(false);
+      expect(isJsonExpression('"a.b"."c.d"')).toBe(true);
+    });
+
+    it('should handle dots inside backticks correctly', () => {
+      expect(isJsonExpression('`a.b.c`')).toBe(false);
+      expect(isJsonExpression('`a.b`.`c.d`')).toBe(true);
+    });
+
+    it('should return true for mixed quoted and unquoted parts', () => {
+      expect(isJsonExpression('"col.with.dots".key')).toBe(true);
+      expect(isJsonExpression('col."key.with.dots"')).toBe(true);
+    });
+
+    it('should handle complex quoted identifiers', () => {
+      expect(isJsonExpression('"table.name"."column.name"."nested"')).toBe(
+        true,
+      );
+    });
+
+    it('should handle expressions with underscores and numbers', () => {
+      expect(isJsonExpression('col_1.key_2.nested_3')).toBe(true);
+      expect(isJsonExpression('table123.column456')).toBe(true);
+    });
+
+    it('should return false for single quoted identifier', () => {
+      expect(isJsonExpression('"singleColumn"')).toBe(false);
+      expect(isJsonExpression('`singleColumn`')).toBe(false);
+    });
+
+    it('should handle type specifiers', () => {
+      expect(isJsonExpression('a.b.:UInt64')).toBe(true);
+      expect(isJsonExpression('col.key.:String')).toBe(true);
+    });
+
+    it('should handle whitespace in parts', () => {
+      expect(isJsonExpression('a . b')).toBe(true);
+      expect(isJsonExpression('a.b. c')).toBe(true);
+    });
+
+    it('should handle leading whitespace', () => {
+      expect(isJsonExpression(' a.b.c')).toBe(true);
+      expect(isJsonExpression('  col.key')).toBe(true);
+      expect(isJsonExpression('\ta.b')).toBe(true);
+    });
+
+    it('should handle trailing whitespace', () => {
+      expect(isJsonExpression('a.b.c ')).toBe(true);
+      expect(isJsonExpression('col.key  ')).toBe(true);
+      expect(isJsonExpression('a.b\t')).toBe(true);
+    });
+
+    it('should handle leading and trailing whitespace', () => {
+      expect(isJsonExpression(' a.b.c ')).toBe(true);
+      expect(isJsonExpression('  col.key  ')).toBe(true);
+      expect(isJsonExpression('\ta.b\t')).toBe(true);
+    });
+
+    it('should correctly handle single quoted strings', () => {
+      expect(isJsonExpression("'a'.b.c")).toBe(false);
+      expect(isJsonExpression("'a'.'b'")).toBe(false);
+      expect(isJsonExpression("'a' . 'b'")).toBe(false);
+      expect(isJsonExpression("'")).toBe(false);
+      expect(isJsonExpression("''")).toBe(false);
+      expect(isJsonExpression("`'a'`.b")).toBe(true);
+      expect(isJsonExpression("`'a`.b")).toBe(true);
+    });
+  });
+
+  describe('findJsonExpressions', () => {
+    it('should handle empty expression', () => {
+      const sql = '';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find a single JSON expression', () => {
+      const sql = 'SELECT a.b.c as alias1, col2 as alias2 FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: 'a.b.c' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find multiple JSON expression', () => {
+      const sql = 'SELECT a.b.c, d.e, col2 FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 7, expr: 'a.b.c' },
+        { index: 14, expr: 'd.e' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expression with type specifier', () => {
+      const sql = 'SELECT a.b.:UInt64, col2 FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: 'a.b.:UInt64' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expression with complex type specifier', () => {
+      const sql = 'SELECT a.b.:Array(String)  , col2 FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: 'a.b.:Array(String)' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions in WHERE clause ', () => {
+      const sql =
+        'SELECT col2 FROM table WHERE a.b.:UInt64 = 1 AND toStartOfDay(a.date) = today()';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 29, expr: 'a.b.:UInt64' },
+        { index: 62, expr: 'a.date' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions in function calls', () => {
+      const sql = "SELECT JSONExtractString(a.b.c, 'key') FROM table";
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 25, expr: 'a.b.c' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find JSON expressions in quoted strings', () => {
+      const sql =
+        "SELECT a.b.c, ResourceAttributes['key.key2'], 'a.b.c' FROM table";
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        {
+          index: 7,
+          expr: 'a.b.c',
+        },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions in math expression', () => {
+      const sql =
+        'SELECT toStartOfDay(a.date + INTERVAL 1 DAY), toStartOfDay(a.date+INTERVAL 1 DAY)';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 20, expr: 'a.date' },
+        { index: 59, expr: 'a.date' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not infinite loop due to unterminated strings', () => {
+      const sql = 'SELECT "';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not infinite loop due to trailing whitespace', () => {
+      const sql = 'SELECT ';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not infinite loop due to mismatched parenthesis', () => {
+      const sql = 'SELECT (';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not infinite loop due to trailing json type specifier', () => {
+      const sql = 'SELECT a.b.:UInt64';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: 'a.b.:UInt64' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find JSON expressions in string that has escaped single quote', () => {
+      const sql = "SELECT 'a.b''''a.b.:UInt64', col2, c.d FROM table";
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 35, expr: 'c.d' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find JSON expressions in string that has escaped single quote 2', () => {
+      const sql = "SELECT '\\'a.b', col2, c.d FROM table";
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 22, expr: 'c.d' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions with underscores and numbers', () => {
+      const sql = 'SELECT json_col.col3.c FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: 'json_col.col3.c' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions with backticks', () => {
+      const sql = 'SELECT `a`.`b`.`cde` FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: '`a`.`b`.`cde`' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions with double quotes', () => {
+      const sql = 'SELECT "a"."b"."cde" FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: '"a"."b"."cde"' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions in tuple', () => {
+      const sql = 'SELECT (a.b, c.d.e) FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 8, expr: 'a.b' },
+        { index: 13, expr: 'c.d.e' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find JSON expressions inside identifiers', () => {
+      const sql = 'SELECT "a.b.c" FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions with weird identifier quoting', () => {
+      const sql = 'SELECT "a_b.2c".b."c." FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 7, expr: '"a_b.2c".b."c."' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find JSON expressions after *', () => {
+      const sql = 'SELECT *, a.b.c FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 10, expr: 'a.b.c' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find a decimal number expression', () => {
+      const sql = 'SELECT 10.50, 2.3, 2, 1.5 - a.b FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [{ index: 28, expr: 'a.b' }];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not find a . as a JSON expression', () => {
+      const sql = 'SELECT . FROM table';
+      const actual = findJsonExpressions(sql);
+      const expected = [];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find a JSON expression with an identifier containing a single-quote', () => {
+      const sql = `SELECT Timestamp,ServiceName,SeverityText,Body,ResourceAttributes.hyperdx.distro."version'" FROM default.otel_logs WHERE (Timestamp >= fromUnixTimestamp64Milli(1759756098000) AND Timestamp <= fromUnixTimestamp64Milli(1759756998000)) ORDER BY Timestamp DESC`;
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 47, expr: `ResourceAttributes.hyperdx.distro."version'"` },
+        { index: 97, expr: `default.otel_logs` },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find a JSON expression with an identifier containing a double-quote', () => {
+      const sql =
+        'SELECT Timestamp,ServiceName,SeverityText,Body,ResourceAttributes.hyperdx.distro.`"version"`';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 47, expr: 'ResourceAttributes.hyperdx.distro.`"version"`' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+
+    it('should find a JSON expression with an identifier containing a backtick', () => {
+      const sql =
+        'SELECT Timestamp,ServiceName,SeverityText,Body,ResourceAttributes.hyperdx.distro."`version`"';
+      const actual = findJsonExpressions(sql);
+      const expected = [
+        { index: 47, expr: 'ResourceAttributes.hyperdx.distro."`version`"' },
+      ];
+      expect(actual).toEqual(expected);
+    });
+  });
+
+  describe('replaceJsonAccesses', () => {
+    it('should handle empty expression', () => {
+      const sql = '';
+      const actual = replaceJsonExpressions(sql);
+      const expected = { replacements: new Map(), sqlWithReplacements: '' };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace a single JSON access', () => {
+      const sql = 'SELECT a.b.c as alias1, col2 as alias2 FROM table';
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([['__hdx_json_replacement_0', 'a.b.c']]),
+        sqlWithReplacements:
+          'SELECT __hdx_json_replacement_0 as alias1, col2 as alias2 FROM table',
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace multiple JSON access', () => {
+      const sql = 'SELECT a.b.c, d.e, col2 FROM table';
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([
+          ['__hdx_json_replacement_0', 'a.b.c'],
+          ['__hdx_json_replacement_1', 'd.e'],
+        ]),
+        sqlWithReplacements:
+          'SELECT __hdx_json_replacement_0, __hdx_json_replacement_1, col2 FROM table',
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace JSON access with type specifier', () => {
+      const sql = 'SELECT a.b.:UInt64, col2 FROM table';
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([['__hdx_json_replacement_0', 'a.b.:UInt64']]),
+        sqlWithReplacements: 'SELECT __hdx_json_replacement_0, col2 FROM table',
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace JSON access with complex type specifier', () => {
+      const sql = 'SELECT a.b.:Array(String), col2 FROM table';
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([
+          ['__hdx_json_replacement_0', 'a.b.:Array(String)'],
+        ]),
+        sqlWithReplacements: 'SELECT __hdx_json_replacement_0, col2 FROM table',
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace JSON expressions in WHERE clause ', () => {
+      const sql =
+        'SELECT col2 FROM table WHERE a.b.:UInt64 = 1 AND toStartOfDay(a.date) = today()';
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([
+          ['__hdx_json_replacement_0', 'a.b.:UInt64'],
+          ['__hdx_json_replacement_1', 'a.date'],
+        ]),
+        sqlWithReplacements:
+          'SELECT col2 FROM table WHERE __hdx_json_replacement_0 = 1 AND toStartOfDay(__hdx_json_replacement_1) = today()',
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should replace JSON expressions in function calls', () => {
+      const sql = "SELECT JSONExtractString(a.b.c, 'key') FROM table";
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([['__hdx_json_replacement_0', 'a.b.c']]),
+        sqlWithReplacements:
+          "SELECT JSONExtractString(__hdx_json_replacement_0, 'key') FROM table",
+      };
+      expect(actual).toEqual(expected);
+    });
+
+    it('should not replace JSON expressions in quoted strings', () => {
+      const sql =
+        "SELECT a.b.c, ResourceAttributes['key.key2'], 'a.b.c' FROM table";
+      const actual = replaceJsonExpressions(sql);
+      const expected = {
+        replacements: new Map([['__hdx_json_replacement_0', 'a.b.c']]),
+        sqlWithReplacements:
+          "SELECT __hdx_json_replacement_0, ResourceAttributes['key.key2'], 'a.b.c' FROM table",
+      };
+      expect(actual).toEqual(expected);
+    });
+  });
+
+  describe('parseToStartOfFunction', () => {
+    it.each([
+      {
+        expr: 'toStartOfDay(a.date)',
+        expected: {
+          function: 'toStartOfDay',
+          columnArgument: 'a.date',
+          formattedRemainingArgs: '',
+        },
+      },
+      {
+        expr: "toStartOfMinute(toDate(ResourceAttributes['timestamp']))",
+        expected: {
+          function: 'toStartOfMinute',
+          columnArgument: "toDate(ResourceAttributes['timestamp'])",
+          formattedRemainingArgs: '',
+        },
+      },
+      {
+        expr: "toStartOfMonth(timestamp, 'America/Los_Angeles')",
+        expected: {
+          function: 'toStartOfMonth',
+          columnArgument: 'timestamp',
+          formattedRemainingArgs: ", 'America/Los_Angeles'",
+        },
+      },
+      {
+        expr: 'toStartOfMonth(`time stamp`)',
+        expected: {
+          function: 'toStartOfMonth',
+          columnArgument: '`time stamp`',
+          formattedRemainingArgs: '',
+        },
+      },
+      {
+        expr: 'toStartOfInterval(timestamp, INTERVAL 1 DAY)',
+        expected: {
+          function: 'toStartOfInterval',
+          columnArgument: 'timestamp',
+          formattedRemainingArgs: ', INTERVAL 1 DAY',
+        },
+      },
+      {
+        expr: "toStartOfInterval(timestamp, INTERVAL 1 DAY, toDateTime('2025-01-01'), 'America/Los_Angeles')",
+        expected: {
+          function: 'toStartOfInterval',
+          columnArgument: 'timestamp',
+          formattedRemainingArgs:
+            ", INTERVAL 1 DAY, toDateTime('2025-01-01'), 'America/Los_Angeles'",
+        },
+      },
+      {
+        expr: "    toStartOfInterval ( timestamp,   INTERVAL  10 DAY,   toDateTime('2025-01-01' ),  'America/Los_Angeles' )   ",
+        expected: {
+          function: 'toStartOfInterval',
+          columnArgument: 'timestamp',
+          formattedRemainingArgs:
+            ", INTERVAL  10 DAY, toDateTime('2025-01-01' ), 'America/Los_Angeles'",
+        },
+      },
+      {
+        expr: 'timestamp',
+        expected: undefined,
+      },
+      {
+        expr: 'toDate(timestamp)',
+        expected: undefined,
+      },
+      {
+        expr: 'toDate(toStartOfDay(timestamp))',
+        expected: undefined,
+      },
+      {
+        expr: 'toStartOfDay(timestamp), toDate(timestamp)',
+        expected: undefined,
+      },
+      {
+        expr: 'toDate(timestamp), toStartOfDay(timestamp)',
+        expected: undefined,
+      },
+      {
+        expr: '',
+        expected: undefined,
+      },
+      {
+        expr: '(toStartOfDay(timestamp))',
+        expected: undefined,
+      },
+      {
+        expr: 'toStartOfDay(',
+        expected: undefined,
+      },
+      {
+        expr: '-toInt64(toStartOfInterval(timestamp, toIntervalMinute(15)))',
+        expected: undefined,
+      },
+      {
+        expr: 'negate(toStartOfMinute(timestamp))',
+        expected: undefined,
+      },
+    ])('Should parse $expr', ({ expr, expected }) => {
+      expect(parseToStartOfFunction(expr)).toEqual(expected);
+    });
+  });
+
+  describe('optimizeTimestampValueExpression', () => {
+    const testCases = [
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey: 'Timestamp',
+        expected: 'Timestamp',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey: undefined,
+        expected: 'Timestamp',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey: '',
+        expected: 'Timestamp',
+      },
+      {
+        // Traces Table
+        timestampValueExpression: 'Timestamp',
+        primaryKey: 'ServiceName, SpanName, toDateTime(Timestamp)',
+        expected: 'Timestamp',
+      },
+      {
+        // Optimized Traces Table
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          'toStartOfHour(Timestamp), ServiceName, SpanName, toDateTime(Timestamp)',
+        expected: 'Timestamp, toStartOfHour(Timestamp)',
+      },
+      {
+        // Unsupported for now as it's not a great primary key, want to just
+        // use default behavior for this
+        timestampValueExpression: 'Timestamp',
+        primaryKey: 'toDateTime(Timestamp), ServiceName, SpanName, Timestamp',
+        expected: 'Timestamp',
+      },
+      {
+        // Inverted primary key order, we should not try to optimize this
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          'ServiceName, toDateTime(Timestamp), SeverityText, toStartOfHour(Timestamp)',
+        expected: 'Timestamp',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey: 'toStartOfHour(Timestamp), other_column, Timestamp',
+        expected: 'Timestamp, toStartOfHour(Timestamp)',
+      },
+      {
+        // When the user has already manually configured an optimized timestamp value expression
+        timestampValueExpression: ' toStartOfHour(Timestamp), Timestamp',
+        primaryKey: 'toStartOfHour(Timestamp), other_column, Timestamp',
+        expected: ' toStartOfHour(Timestamp), Timestamp',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          'toStartOfInterval(Timestamp, INTERVAL 1 HOUR), other_column, Timestamp',
+        expected: 'Timestamp, toStartOfInterval(Timestamp, INTERVAL 1 HOUR)',
+      },
+      {
+        // test variation of toUnixTimestamp
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          'toStartOfMinute(Timestamp), user_id, status, toUnixTimestamp64Nano(Timestamp)',
+        expected: 'Timestamp, toStartOfMinute(Timestamp)',
+      },
+      {
+        // TimestampTime is not matched since it is not in the timestampValueExpression
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          'toStartOfMinute(TimestampTime), user_id, status, Timestamp',
+        expected: 'Timestamp',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          '909]`23`9082eh[928e1p92e81hp92, d81p92d817h1p-93287dh129d7812hgpd91832h, toStartOfMinute(Timestamp), other_column, Timestamp',
+        expected: 'Timestamp, toStartOfMinute(Timestamp)',
+      },
+      {
+        timestampValueExpression: '`Time stamp`',
+        primaryKey: 'toStartOfMinute(`Time stamp`), other_column, `Time stamp`',
+        expected: '`Time stamp`, toStartOfMinute(`Time stamp`)',
+      },
+      {
+        timestampValueExpression: 'Timestamp',
+        primaryKey:
+          '-toInt64(toStartOfInterval(Timestamp, toIntervalMinute(15))), service_id, Timestamp',
+        expected: 'Timestamp',
+      },
+    ] as const;
+
+    it.each(testCases)(
+      'should return optimized expression $expected for original expression $timestampValueExpression and primary key $primaryKey',
+      ({ timestampValueExpression, primaryKey, expected }) => {
+        const actual = optimizeTimestampValueExpression(
+          timestampValueExpression,
+          primaryKey,
+        );
+
+        expect(actual).toBe(expected);
+      },
+    );
+  });
+
+  describe('getAlignedDateRange', () => {
+    it('should align start time down to the previous minute boundary', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:37Z'), // 37 seconds
+        new Date('2025-11-26T12:25:00Z'),
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '1 minute',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:23:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T12:25:00.000Z');
+    });
+
+    it('should align end time up to the next minute boundary', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:00Z'),
+        new Date('2025-11-26T12:25:42Z'), // 42 seconds
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '1 minute',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:23:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T12:26:00.000Z');
+    });
+
+    it('should align both start and end times with 5 minute granularity', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:17Z'), // Should round down to 12:20:00
+        new Date('2025-11-26T12:27:42Z'), // Should round up to 12:30:00
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '5 minute',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:20:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T12:30:00.000Z');
+    });
+
+    it('should align with 30 second granularity', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:17Z'), // Should round down to 12:23:00
+        new Date('2025-11-26T12:25:42Z'), // Should round up to 12:26:00
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '30 second',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:23:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T12:26:00.000Z');
+    });
+
+    it('should align with 1 day granularity', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:17Z'), // Should round down to start of day
+        new Date('2025-11-28T08:15:00Z'), // Should round up to start of next day
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '1 day',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T00:00:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-29T00:00:00.000Z');
+    });
+
+    it('should not change range when already aligned to the interval', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:00Z'), // Already aligned
+        new Date('2025-11-26T12:25:00Z'), // Already aligned
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '1 minute',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:23:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T12:25:00.000Z');
+    });
+
+    it('should align with 15 minute granularity', () => {
+      const dateRange: [Date, Date] = [
+        new Date('2025-11-26T12:23:17Z'), // Should round down to 12:15:00
+        new Date('2025-11-26T12:47:42Z'), // Should round up to 13:00:00
+      ];
+
+      const [alignedStart, alignedEnd] = getAlignedDateRange(
+        dateRange,
+        '15 minute',
+      );
+
+      expect(alignedStart.toISOString()).toBe('2025-11-26T12:15:00.000Z');
+      expect(alignedEnd.toISOString()).toBe('2025-11-26T13:00:00.000Z');
+    });
+  });
+
+  describe('extractSettingsClauseFromEnd', () => {
+    test.each([
+      {
+        label: 'no settings clause',
+        sql: 'SELECT * FROM table',
+        withoutSettingsClause: 'SELECT * FROM table',
+        settingsClause: undefined,
+      },
+      {
+        label: 'basic',
+        sql: 'SELECT * FROM table SETTINGS opt=1, cast=1',
+        withoutSettingsClause: 'SELECT * FROM table',
+        settingsClause: 'SETTINGS opt=1, cast=1',
+      },
+      {
+        label: 'basic with semicolon',
+        sql: 'SELECT * FROM table SETTINGS opt = 1, cast = 1;',
+        withoutSettingsClause: 'SELECT * FROM table',
+        settingsClause: 'SETTINGS opt = 1, cast = 1',
+      },
+      {
+        label: 'with WHERE clause',
+        sql: 'SELECT * FROM table WHERE col=Value SETTINGS opt = 1, cast = 1;',
+        withoutSettingsClause: 'SELECT * FROM table WHERE col=Value',
+        settingsClause: 'SETTINGS opt = 1, cast = 1',
+      },
+      {
+        label: 'SETTINGS not at end',
+        sql: 'SELECT * FROM table WHERE col=Value SETTINGS opt = 1, cast = 1 FORMAT json;',
+        withoutSettingsClause: 'SELECT * FROM table WHERE col=Value',
+        // This test case illustrates that subsequent clauses will also be extracted.
+        settingsClause: 'SETTINGS opt = 1, cast = 1 FORMAT json',
+      },
+    ])(
+      'Extracts SETTINGS clause from: "$label" query',
+      ({ sql, settingsClause, withoutSettingsClause }) => {
+        const [remaining, extractedSettingsClause] =
+          extractSettingsClauseFromEnd(sql);
+        expect(remaining).toBe(withoutSettingsClause);
+        expect(extractedSettingsClause).toBe(settingsClause);
+      },
+    );
+  });
+
+  describe('parseToNumber', () => {
+    it('returns `undefined` for an empty string', () => {
+      expect(parseToNumber('')).toBe(undefined);
+    });
+
+    it('returns `undefined` for a whitespace string', () => {
+      expect(parseToNumber(' ')).toBe(undefined);
+    });
+
+    it('returns `undefined` for a non-numeric string', () => {
+      expect(parseToNumber(' . ? / ')).toBe(undefined);
+      expect(parseToNumber('  some string value ')).toBe(undefined);
+      expect(parseToNumber('5678abc')).toBe(undefined);
+    });
+
+    it('returns `undefined` for an infinite number', () => {
+      expect(parseToNumber('Infinity')).toBe(undefined);
+      expect(parseToNumber('-Infinity')).toBe(undefined);
+    });
+
+    it('returns the number value for a parseable number', () => {
+      expect(parseToNumber('123')).toBe(123);
+      expect(parseToNumber('0.123')).toBe(0.123);
+      expect(parseToNumber('1.123')).toBe(1.123);
+      expect(parseToNumber('10000000')).toBe(10000000);
+    });
+  });
+
+  describe('joinQuerySettings', () => {
+    test('returns `undefined` if the querySettings are `undefined` or empty', () => {
+      expect(joinQuerySettings(undefined)).toBe(undefined);
+      expect(joinQuerySettings([])).toBe(undefined);
+    });
+
+    test('filters out items whose `setting` or `value` field is empty', () => {
+      expect(
+        joinQuerySettings([
+          { setting: '', value: '1' },
+          { setting: 'async_insert', value: '' },
+          { setting: 'async_insert_busy_timeout_min_ms', value: '20000' },
+        ]),
+      ).toEqual('async_insert_busy_timeout_min_ms = 20000');
+    });
+
+    test('joins the values into key value pairs', () => {
+      const result = joinQuerySettings([
+        { setting: 'additional_result_filter', value: 'x != 2' },
+        { setting: 'async_insert', value: '0' },
+        { setting: 'async_insert_busy_timeout_min_ms', value: '20000' },
+      ]);
+
+      expect(result).toContain("additional_result_filter = 'x != 2'");
+      expect(result).toContain('async_insert = 0');
+      expect(result).toContain('async_insert_busy_timeout_min_ms = 20000');
+    });
+
+    test('joins the result into a comma separated string', () => {
+      expect(
+        joinQuerySettings([
+          { setting: 'additional_result_filter', value: 'x != 2' },
+          { setting: 'async_insert', value: '0' },
+          { setting: 'async_insert_busy_timeout_min_ms', value: '20000' },
+        ]),
+      ).toEqual(
+        "additional_result_filter = 'x != 2', async_insert = 0, async_insert_busy_timeout_min_ms = 20000",
+      );
+    });
+
+    test('wraps non-numeric and infinite numeric values in quotes', () => {
+      expect(
+        joinQuerySettings([{ setting: 'setting_name', value: 'x != 2' }]),
+      ).toEqual("setting_name = 'x != 2'");
+
+      expect(
+        joinQuerySettings([{ setting: 'setting_name', value: 'string value' }]),
+      ).toEqual("setting_name = 'string value'");
+
+      expect(
+        joinQuerySettings([{ setting: 'setting_name', value: '1000' }]),
+      ).toEqual('setting_name = 1000');
+
+      expect(
+        joinQuerySettings([{ setting: 'setting_name', value: 'Infinity' }]),
+      ).toEqual("setting_name = 'Infinity'");
+    });
+  });
+  describe('parseTokenizerFromTextIndex', () => {
+    it.each([
+      {
+        type: 'text',
+        expected: undefined,
+      },
+      {
+        type: 'text()',
+        expected: undefined,
+      },
+      {
+        type: ' text ( tokenizer= array ) ',
+        expected: { type: 'array' },
+      },
+      {
+        type: 'text(tokenizer=splitByNonAlpha)',
+        expected: { type: 'splitByNonAlpha' },
+      },
+      {
+        type: 'text( tokenizer = splitByNonAlpha )',
+        expected: { type: 'splitByNonAlpha' },
+      },
+      {
+        type: "text(tokenizer = 'splitByNonAlpha')",
+        expected: { type: 'splitByNonAlpha' },
+      },
+      {
+        type: 'text(tokenizer = "splitByNonAlpha")',
+        expected: { type: 'splitByNonAlpha' },
+      },
+      {
+        type: 'text(tokenizer = splitByString())',
+        expected: { type: 'splitByString', separators: [' '] },
+      },
+      {
+        type: `text(tokenizer = splitByString([', ', '; ', '\\n', '" ', '\\\\', '\\t', '(', ')']))`,
+        expected: {
+          type: 'splitByString',
+          separators: [', ', '; ', '\n', '" ', '\\', '\t', '(', ')'],
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=sparseGrams(2, 5, 10))',
+        expected: {
+          type: 'sparseGrams',
+          minLength: 2,
+          maxLength: 5,
+          minCutoffLength: 10,
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=sparseGrams(2, 5))',
+        expected: {
+          type: 'sparseGrams',
+          minLength: 2,
+          maxLength: 5,
+          minCutoffLength: undefined,
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=sparseGrams(2))',
+        expected: {
+          type: 'sparseGrams',
+          minLength: 2,
+          maxLength: 10,
+          minCutoffLength: undefined,
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=sparseGrams)',
+        expected: {
+          type: 'sparseGrams',
+          minLength: 3,
+          maxLength: 10,
+          minCutoffLength: undefined,
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer= sparseGrams ())',
+        expected: {
+          type: 'sparseGrams',
+          minLength: 3,
+          maxLength: 10,
+          minCutoffLength: undefined,
+        },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=unknown)',
+        expected: undefined,
+      },
+      {
+        type: '',
+        expected: undefined,
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=array)',
+        expected: { type: 'array' },
+      },
+      {
+        type: 'text(preprocessor=lower(s), tokenizer=ngrams)',
+        expected: { type: 'ngrams', n: 3 },
+      },
+      {
+        type: 'text(tokenizer=ngrams())',
+        expected: { type: 'ngrams', n: 3 },
+      },
+      {
+        type: 'text(tokenizer=ngrams(20))',
+        expected: { type: 'ngrams', n: 20 },
+      },
+    ])('should correctly parse tokenizer from: $type', ({ type, expected }) => {
+      const result = parseTokenizerFromTextIndex({
+        type: 'text',
+        typeFull: type,
+        name: 'text_idx',
+        expression: 'Body',
+        granularity: 1000,
+      });
+      expect(result).toEqual(expected);
+    });
+  });
+
+  describe('aliasMapToWithClauses', () => {
+    it('should return undefined for undefined input', () => {
+      expect(aliasMapToWithClauses(undefined)).toBeUndefined();
+    });
+
+    it('should return undefined for empty alias map', () => {
+      expect(aliasMapToWithClauses({})).toBeUndefined();
+    });
+
+    it('should return undefined when all values are undefined', () => {
+      expect(
+        aliasMapToWithClauses({ body: undefined, service: undefined }),
+      ).toBeUndefined();
+    });
+
+    it('should return undefined when all values are empty strings', () => {
+      expect(
+        aliasMapToWithClauses({ body: '', service: '  ' }),
+      ).toBeUndefined();
+    });
+
+    it('should convert a single alias to a WITH clause', () => {
+      expect(aliasMapToWithClauses({ body: 'toString(Body)' })).toEqual([
+        {
+          name: 'body',
+          sql: { sql: 'toString(Body)', params: {} },
+          isSubquery: false,
+        },
+      ]);
+    });
+
+    it('should convert multiple aliases to WITH clauses', () => {
+      const result = aliasMapToWithClauses({
+        body: 'toString(Body)',
+        service: "ResourceAttributes['service.name']",
+      });
+      expect(result).toEqual([
+        {
+          name: 'body',
+          sql: { sql: 'toString(Body)', params: {} },
+          isSubquery: false,
+        },
+        {
+          name: 'service',
+          sql: {
+            sql: "ResourceAttributes['service.name']",
+            params: {},
+          },
+          isSubquery: false,
+        },
+      ]);
+    });
+
+    it('should skip entries with undefined or empty values', () => {
+      const result = aliasMapToWithClauses({
+        body: 'toString(Body)',
+        empty: '',
+        blank: '  ',
+        missing: undefined,
+        service: "ResourceAttributes['service.name']",
+      });
+      expect(result).toHaveLength(2);
+      expect(result![0].name).toBe('body');
+      expect(result![1].name).toBe('service');
+    });
+  });
+
+  describe('getLocalTableFromDistributedTable', () => {
+    const makeMetadata = (engineFull: string) =>
+      ({ engine_full: engineFull }) as any;
+
+    it('parses a simple Distributed engine_full', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata("Distributed('default', 'mydb', 'local_table', rand())"),
+      );
+      expect(result).toEqual({
+        cluster: 'default',
+        database: 'mydb',
+        table: 'local_table',
+      });
+    });
+
+    it('parses without a sharding key', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata("Distributed('cluster', 'db', 'tbl')"),
+      );
+      expect(result).toEqual({
+        cluster: 'cluster',
+        database: 'db',
+        table: 'tbl',
+      });
+    });
+
+    it('handles double-quoted identifiers', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata('Distributed("cluster", "my_database", "my_table")'),
+      );
+      expect(result).toEqual({
+        cluster: 'cluster',
+        database: 'my_database',
+        table: 'my_table',
+      });
+    });
+
+    it('handles backtick-quoted identifiers', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata("Distributed('cluster', `mydb`, `local_tbl`, rand())"),
+      );
+      expect(result).toEqual({
+        cluster: 'cluster',
+        database: 'mydb',
+        table: 'local_tbl',
+      });
+    });
+
+    it('handles unquoted identifiers', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata('Distributed(cluster, mydb, local_tbl, rand())'),
+      );
+      expect(result).toEqual({
+        cluster: 'cluster',
+        database: 'mydb',
+        table: 'local_tbl',
+      });
+    });
+
+    it('returns undefined when engine_full has fewer than 3 args', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata("Distributed('cluster', 'db')"),
+      );
+      expect(result).toBeUndefined();
+    });
+
+    it('returns undefined when engine_full does not match Distributed pattern', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata('MergeTree() ORDER BY id'),
+      );
+      expect(result).toBeUndefined();
+    });
+
+    it('handles a complex sharding expression with nested parentheses', () => {
+      const result = getDistributedTableArgs(
+        makeMetadata(
+          "Distributed('cluster', 'db', 'tbl', sipHash64(UserID, EventDate))",
+        ),
+      );
+      expect(result).toEqual({
+        cluster: 'cluster',
+        database: 'db',
+        table: 'tbl',
+      });
+    });
+  });
+
+  describe('pickBucketTimestampColumn', () => {
+    // Stubs the small subset of Metadata that pickBucketTimestampColumn needs.
+    function makeMetadata(types: Record<string, string>) {
+      return {
+        getColumn: async ({ column }: { column: string }) =>
+          // eslint-disable-next-line security/detect-object-injection
+          types[column] ? { type: types[column] } : undefined,
+      };
+    }
+
+    const opts = {
+      databaseName: 'logs',
+      tableName: 'events',
+      connectionId: 'conn',
+    };
+
+    it('single-column input passes through unchanged', async () => {
+      const metadata = makeMetadata({ Timestamp: 'DateTime64(9)' });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'Timestamp',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('Timestamp');
+    });
+
+    it('single-column input does not hit metadata', async () => {
+      const getColumn = jest.fn();
+      const metadata = { getColumn };
+      await pickBucketTimestampColumn({
+        timestampValueExpression: 'EventTime',
+        metadata,
+        ...opts,
+      });
+      expect(getColumn).not.toHaveBeenCalled();
+    });
+
+    it('multi-column: highest-precision DateTime wins, Date skipped (EventDate, EventTime)', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: 'DateTime',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('multi-column: DateTime64 beats DateTime (EventDate, EventTime, Timestamp)', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: 'DateTime',
+        Timestamp: 'DateTime64(9)',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime, Timestamp',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('Timestamp');
+    });
+
+    it('multi-column: order does not change the pick (Timestamp first)', async () => {
+      const metadata = makeMetadata({
+        Timestamp: 'DateTime64(9)',
+        EventTime: 'DateTime',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'Timestamp, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('Timestamp');
+    });
+
+    it('all-Date fallback: returns first token with a warn', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        OtherDate: 'Date',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, OtherDate',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventDate');
+    });
+
+    it('Nullable(DateTime) still classifies as DateTime', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: 'Nullable(DateTime)',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('DateTime with an explicit timezone still classifies as DateTime', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: "DateTime('UTC')",
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('Nullable(DateTime) with an explicit timezone still classifies as DateTime', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: "Nullable(DateTime('Europe/Berlin'))",
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('higher DateTime64 precision wins over lower', async () => {
+      const metadata = makeMetadata({
+        TsMs: 'DateTime64(3)',
+        TsNs: 'DateTime64(9)',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'TsMs, TsNs',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('TsNs');
+    });
+
+    it('unresolvable column does not block resolution of the resolvable sibling', async () => {
+      const metadata = makeMetadata({
+        EventTime: 'DateTime',
+        // CteAlias intentionally omitted; metadata.getColumn returns undefined
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'CteAlias, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+  });
+});

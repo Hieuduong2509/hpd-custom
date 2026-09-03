@@ -1,0 +1,18 @@
+# Normalize line endings to LF for everything Git considers text, regardless
+# of the checkout OS's core.autocrlf setting. Without this, a Windows
+# checkout converts LF -> CRLF on every text file, which is silently fine for
+# most files but breaks anything with a shebang that gets executed as a
+# Linux/container script: `#!/bin/sh\r` is not a valid interpreter path, so
+# the container exits immediately with "no such file or directory" (this bit
+# docker/otel-collector/entrypoint.sh — see hyperdx-rbac-implementation-plan.md).
+* text=auto eol=lf
+
+# Anything invoked directly as a shell script/entrypoint inside a Linux
+# container or a git hook — belt-and-suspenders on top of the blanket rule
+# above, and self-documenting about *why* these specifically must stay LF.
+*.sh text eol=lf
+.husky/* text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+
+/.yarn/releases/** binary

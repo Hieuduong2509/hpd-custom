@@ -1,0 +1,921 @@
+# ============================================================================
+# HyperDX fork — toàn bộ stack cho namespace sandbox (mongodb, clickhouse,
+# otel-collector, hyperdx-api) trong 1 file duy nhất, dán 1 lần qua nút
+# Create trong Headlamp.
+#
+# CẢ hyperdx-api VÀ otel-collector đều dùng image TỰ BUILD
+# (hieuduongnewai/hyperdx:latest, hieuduongnewai/hyperdx-otel-collector:latest)
+# — image otel-collector chính thức KHÔNG tương thích với app fork này
+# (lỗi 'invalid keys: json' do lệch phiên bản schema config OpAMP).
+#
+# UI truy cập được tại https://hyperdx.sandbox.kamimind.ai/ (Service
+# "hyperdx", cuối file).
+#
+# Trước khi dán: đã build + push CẢ 2 image (xem build-and-push.sh) — nếu
+# chưa, các Deployment sẽ vào trạng thái ImagePullBackOff.
+# ============================================================================
+---
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data
+  namespace: sandbox
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: <your-storage-class>   # set this if the cluster has no default StorageClass
+---
+# mongo:5.0.14-focal + tcpSocket probes — cùng version/kiểu probe với bản
+# HyperDX Helm chart chính thức bạn đã thấy chạy ổn ở namespace logging.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: sandbox
+  labels:
+    app: db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:5.0.14-focal
+          ports:
+            - containerPort: 27017
+              protocol: TCP
+          volumeMounts:
+            - name: db-data
+              mountPath: /data/db
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          livenessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: sandbox
+spec:
+  selector:
+    app: db
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+---
+# config.xml: dựa trên docker/clickhouse/local/config.xml trong repo, đã có
+# fix custom_settings_prefixes=custom,hyperdx (nếu không có dòng này, mọi
+# query sẽ báo lỗi "Setting custom_hdx_api_key is neither a builtin setting...").
+#
+# users.xml: thêm 2 user riêng theo đúng mẫu bạn thấy ở namespace logging
+# (app / otelcollector) thay vì dùng chung 1 user default cho mọi thứ — khớp
+# với username/password đã khai trong 10-hyperdx-api-deployment.yaml
+# (DEFAULT_CONNECTIONS) và 08-otel-collector-deployment.yaml (CLICKHOUSE_USER/
+# CLICKHOUSE_PASSWORD).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ch-server-config
+  namespace: sandbox
+data:
+  config.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <logger>
+            <level>debug</level>
+            <console>true</console>
+            <log remove="remove" />
+            <errorlog remove="remove" />
+        </logger>
+
+        <listen_host>0.0.0.0</listen_host>
+        <http_port>8123</http_port>
+        <tcp_port>9000</tcp_port>
+        <interserver_http_host>ch-server</interserver_http_host>
+        <interserver_http_port>9009</interserver_http_port>
+
+        <max_connections>4096</max_connections>
+        <keep_alive_timeout>64</keep_alive_timeout>
+        <max_concurrent_queries>100</max_concurrent_queries>
+        <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+        <mark_cache_size>5368709120</mark_cache_size>
+
+        <path>/var/lib/clickhouse/</path>
+        <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+        <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+
+        <user_directories>
+            <users_xml>
+                <path>users.xml</path>
+            </users_xml>
+        </user_directories>
+        <default_profile>default</default_profile>
+        <default_database>default</default_database>
+        <timezone>UTC</timezone>
+        <mlock_executable>false</mlock_executable>
+
+        <access_control_path>/var/lib/clickhouse/access</access_control_path>
+
+        <prometheus>
+            <port>9363</port>
+            <metrics>true</metrics>
+            <events>true</events>
+            <asynchronous_metrics>true</asynchronous_metrics>
+            <errors>true</errors>
+            <handlers>
+                <metrics_handler>
+                    <url>/metrics</url>
+                    <handler>
+                        <type>expose_metrics</type>
+                        <metrics>true</metrics>
+                        <asynchronous_metrics>true</asynchronous_metrics>
+                        <events>true</events>
+                        <errors>true</errors>
+                    </handler>
+                </metrics_handler>
+                <remote_write_handler>
+                    <url>/write</url>
+                    <handler>
+                        <type>remote_write</type>
+                        <database>default</database>
+                        <table>metrics_ts</table>
+                    </handler>
+                </remote_write_handler>
+                <remote_read_handler>
+                    <url>/read</url>
+                    <handler>
+                        <type>remote_read</type>
+                        <database>default</database>
+                        <table>metrics_ts</table>
+                    </handler>
+                </remote_read_handler>
+            </handlers>
+        </prometheus>
+
+        <query_log>
+            <database>system</database>
+            <table>query_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_log>
+
+        <metric_log>
+            <database>system</database>
+            <table>metric_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+        </metric_log>
+
+        <asynchronous_metric_log>
+            <database>system</database>
+            <table>asynchronous_metric_log</table>
+            <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+        </asynchronous_metric_log>
+
+        <opentelemetry_span_log>
+            <engine>
+                engine MergeTree
+                partition by toYYYYMM(finish_date)
+                order by (finish_date, finish_time_us, trace_id)
+            </engine>
+            <database>system</database>
+            <table>opentelemetry_span_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </opentelemetry_span_log>
+
+        <crash_log>
+            <database>system</database>
+            <table>crash_log</table>
+            <partition_by />
+            <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+        </crash_log>
+
+        <processors_profile_log>
+            <database>system</database>
+            <table>processors_profile_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </processors_profile_log>
+
+        <part_log>
+            <database>system</database>
+            <table>part_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </part_log>
+
+        <trace_log>
+            <database>system</database>
+            <table>trace_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </trace_log>
+
+        <query_thread_log>
+            <database>system</database>
+            <table>query_thread_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_thread_log>
+
+        <query_views_log>
+            <database>system</database>
+            <table>query_views_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_views_log>
+
+        <remote_servers>
+            <hdx_cluster>
+                <shard>
+                    <replica>
+                        <host>ch-server</host>
+                        <port>9000</port>
+                    </replica>
+                </shard>
+            </hdx_cluster>
+        </remote_servers>
+
+        <distributed_ddl>
+            <path>/clickhouse/task_queue/ddl</path>
+        </distributed_ddl>
+
+        <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+
+        <custom_settings_prefixes>custom,hyperdx</custom_settings_prefixes>
+    </clickhouse>
+  users.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <profiles>
+            <default>
+                <max_memory_usage>10000000000</max_memory_usage>
+                <use_uncompressed_cache>0</use_uncompressed_cache>
+                <load_balancing>in_order</load_balancing>
+                <log_queries>1</log_queries>
+                <allow_experimental_time_series_table>1</allow_experimental_time_series_table>
+            </default>
+        </profiles>
+
+        <users>
+            <!-- Admin/bootstrap user. Empty password — only safe because the
+                 ch-server Service is ClusterIP-only (not exposed outside the
+                 cluster). Do not add an Ingress/NodePort to it. -->
+            <default>
+                <password></password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+                <access_management>1</access_management>
+            </default>
+            <!-- Used by the hyperdx-api app container (DEFAULT_CONNECTIONS). -->
+            <app>
+                <password>hyperdx</password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+            </app>
+            <!-- Used by the otel-collector container (CLICKHOUSE_USER/CLICKHOUSE_PASSWORD).
+                 access_management=1 required: the collector's startup seed script
+                 (00009_tenant_isolation_policies.sql) runs DROP/CREATE ROW POLICY,
+                 which needs the ACCESS MANAGEMENT privilege — without it ClickHouse
+                 rejects the query with "Not enough privileges ... grant DROP ROW
+                 POLICY ON default.otel_logs". -->
+            <otelcollector>
+                <password>otelcollectorpass</password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+                <access_management>1</access_management>
+            </otelcollector>
+        </users>
+
+        <quotas>
+            <default>
+                <interval>
+                    <duration>3600</duration>
+                    <queries>0</queries>
+                    <errors>0</errors>
+                    <result_rows>0</result_rows>
+                    <read_rows>0</read_rows>
+                    <execution_time>0</execution_time>
+                </interval>
+            </default>
+        </quotas>
+    </clickhouse>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ch-data
+  namespace: sandbox
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <your-storage-class>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ch-logs
+  namespace: sandbox
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: <your-storage-class>
+---
+# Cần 04-clickhouse-configmap.yaml, 05-clickhouse-pvc.yaml, 05b-clickhouse-logs-pvc.yaml
+# tạo trước. Thêm startupProbe + lifecycle preStop (flush log trước khi pod bị
+# kill) giống mẫu namespace logging — giúp ClickHouse tắt sạch hơn khi pod
+# restart/reschedule, giảm rủi ro mất dữ liệu chưa flush.
+#
+# LƯU Ý: ClickHouse chỉ đọc users.xml/config.xml lúc pod KHỞI ĐỘNG, không tự
+# reload khi ConfigMap đổi. Mỗi lần sửa nội dung 04-clickhouse-configmap.yaml
+# (vd. đổi quyền user), phải force pod ch-server restart để áp dụng — cách
+# không cần quyền delete: tăng số trong annotation "config-rev" dưới đây rồi
+# Edit lại Deployment này trong Headlamp (đổi spec => strategy Recreate sẽ tự
+# xoá pod cũ, tạo pod mới đọc config mới).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ch-server
+  namespace: sandbox
+  labels:
+    app: ch-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ch-server
+  template:
+    metadata:
+      labels:
+        app: ch-server
+      annotations:
+        config-rev: "2"
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.7-alpine
+          ports:
+            - containerPort: 8123
+              name: http
+              protocol: TCP
+            - containerPort: 9000
+              name: native
+              protocol: TCP
+            - containerPort: 9363
+              name: prometheus
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: ch-config
+              mountPath: /etc/clickhouse-server/config.xml
+              subPath: config.xml
+            - name: ch-config
+              mountPath: /etc/clickhouse-server/users.xml
+              subPath: users.xml
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: logs
+              mountPath: /var/log/clickhouse-server
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+              scheme: HTTP
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - "-c"
+                  - |
+                    clickhouse-client --query "SYSTEM STOP MERGES" || true
+                    clickhouse-client --query "SYSTEM STOP MOVES" || true
+                    clickhouse-client --query "SYSTEM FLUSH LOGS" || true
+                    sleep 5
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 90
+      dnsPolicy: ClusterFirst
+      volumes:
+        - name: ch-config
+          configMap:
+            name: ch-server-config
+            defaultMode: 420
+        - name: data
+          persistentVolumeClaim:
+            claimName: ch-data
+        - name: logs
+          persistentVolumeClaim:
+            claimName: ch-logs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ch-server
+  namespace: sandbox
+spec:
+  selector:
+    app: ch-server
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000
+    - name: prometheus
+      port: 9363
+      targetPort: 9363
+---
+# PHẢI tự build image này (không dùng bản chính thức docker.hyperdx.io/...
+# được nữa) — đã thử dùng image chính thức 2.7.1 và bị lỗi:
+#   'exporters' error reading configuration for "clickhouse": '' has invalid keys: json
+# Nguyên nhân: hyperdx-api (build từ source hiện tại, mới hơn bản release
+# 2.7.1) gửi xuống collector 1 field cấu hình ("json") mà bản otel-collector
+# 2.7.1 chính thức không hiểu — 2 bên lệch phiên bản schema OpAMP. Bắt buộc
+# dùng collector build từ ĐÚNG source code này để khớp phiên bản.
+#
+# CLICKHOUSE_USER/PASSWORD khớp với user "otelcollector" đã tạo trong
+# 04-clickhouse-configmap.yaml. HYPERDX_API_KEY để plain value vì bạn
+# không có quyền tạo Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: sandbox
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: hieuduongnewai/hyperdx-otel-collector:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 13133
+              name: health
+              protocol: TCP
+            - containerPort: 4317
+              name: otlp-grpc
+              protocol: TCP
+            - containerPort: 4318
+              name: otlp-http
+              protocol: TCP
+            - containerPort: 8888
+              name: metrics
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_ENDPOINT
+              value: "tcp://ch-server:9000?dial_timeout=10s"
+            - name: CLICKHOUSE_SERVER_ENDPOINT
+              value: "ch-server:9000"
+            - name: CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT
+              value: "ch-server:9363"
+            - name: CLICKHOUSE_USER
+              value: "otelcollector"
+            - name: CLICKHOUSE_PASSWORD
+              value: "otelcollectorpass"
+            - name: HYPERDX_OTEL_EXPORTER_CLICKHOUSE_DATABASE
+              value: "default"
+            - name: HYPERDX_API_KEY
+              value: "bdb7b60d-59f0-45a6-91c1-f3396aec9d0e"
+            - name: OPAMP_SERVER_URL
+              value: "http://hyperdx-api:4320"
+            - name: HYPERDX_LOG_LEVEL
+              value: "info"
+            - name: OTEL_SUPERVISOR_LOGS
+              value: "true"
+            # Yêu cầu #6: retention 30 ngày. Chỉ áp dụng khi collector tạo
+            # bảng lần đầu lúc khởi động (fresh ClickHouse, đúng trường hợp
+            # namespace sandbox hiện đang trống).
+            - name: HYPERDX_OTEL_EXPORTER_TABLES_TTL
+              value: "720h"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+              scheme: HTTP
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+---
+# Tên "otel-collector-service" — theo đúng ví dụ bạn đưa ra cho quy tắc
+# wildcard domain: port 4318 không phải 80 nên URL public sẽ là
+# https://otel-collector-service--4318.sandbox.kamimind.ai/
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-service
+  namespace: sandbox
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: health
+      port: 13133
+      targetPort: 13133
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: metrics
+      port: 8888
+      targetPort: 8888
+---
+# API + App gộp 1 pod (đúng kiểu bạn đã dùng trước đây: 1 pod db, 1 pod
+# clickhouse, 1 pod hyperdx). Thêm initContainer chờ MongoDB sẵn sàng (tránh
+# app crash-loop lúc mongo chưa kịp lên). DEFAULT_SOURCES thêm Metrics và
+# Sessions (đúng mẫu bạn đã thấy chạy ổn ở namespace logging) — nếu không
+# thêm, HyperDX chỉ có Logs/Traces như bản cũ, thiếu trang Metrics/Sessions.
+# HYPERDX_API_KEY để plain value vì không có quyền Secret.
+# FRONTEND_URL = https://hyperdx.sandbox.kamimind.ai — khớp với Service MỚI
+# tên "hyperdx" (file 12-hyperdx-public-service.yaml), không phải Service
+# "hyperdx-api" (đó vẫn giữ nguyên, chỉ dùng nội bộ cluster).
+# BUG ĐÃ VÁ: source "Logs" trước đây dùng timestampValueExpression:
+# "TimestampTime" (copy từ mẫu namespace logging, chạy ClickHouse bản mới
+# hơn 26.2 có cột TimestampTime riêng cho bảng otel_logs). ClickHouse bạn
+# đang chạy (25.7-alpine, < 26.2) dùng schema "compatibility"
+# (docker/otel-collector/schema/seed/00002_otel_logs_compat.sql) — bảng
+# otel_logs ở đây CHỈ có cột "Timestamp", không có "TimestampTime" → mọi
+# query xem Logs báo lỗi "Unknown expression or function identifier
+# TimestampTime". Đã đổi lại thành "Timestamp" cho đúng schema thật.
+# (Traces/Sessions không bị lỗi này: Traces vốn đã dùng đúng "Timestamp",
+# còn bảng hyperdx_sessions có cột TimestampTime thật nên Sessions giữ
+# nguyên "TimestampTime".)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperdx-api
+  namespace: sandbox
+  labels:
+    app: hyperdx-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperdx-api
+  template:
+    metadata:
+      labels:
+        app: hyperdx-api
+    spec:
+      initContainers:
+        - name: wait-for-mongodb
+          image: busybox:1.36
+          command:
+            - sh
+            - "-c"
+            - "until nc -z db 27017; do echo waiting for mongodb; sleep 2; done;"
+          imagePullPolicy: IfNotPresent
+      containers:
+        - name: api
+          image: hieuduongnewai/hyperdx:latest
+          # Always, không phải IfNotPresent: node đã cache image tên
+          # "hieuduongnewai/hyperdx:latest" từ lần deploy đầu, nên restart
+          # pod (kể cả bump annotation) KHÔNG tự kiểm tra lại Docker Hub —
+          # phải Always để mỗi lần pod khởi động lại đều tải bản mới nhất
+          # nếu bạn đã build+push lại. Đây là nguyên nhân khiến code sửa
+          # (RLS theo API key) không có hiệu lực dù đã build+push+restart.
+          imagePullPolicy: Always
+          ports:
+            - name: app-port
+              containerPort: 3000
+              protocol: TCP
+            - name: api-port
+              containerPort: 8000
+              protocol: TCP
+            - name: opamp-port
+              containerPort: 4320
+              protocol: TCP
+          env:
+            - name: HYPERDX_API_KEY
+              value: "bdb7b60d-59f0-45a6-91c1-f3396aec9d0e"
+            - name: HYPERDX_API_PORT
+              value: "8000"
+            - name: HYPERDX_APP_PORT
+              value: "3000"
+            - name: FRONTEND_URL
+              value: "https://hyperdx.sandbox.kamimind.ai"
+            - name: SERVER_URL
+              value: "http://hyperdx-api:8000"
+            - name: HYPERDX_LOG_LEVEL
+              value: "debug"
+            - name: MONGO_URI
+              value: "mongodb://db:27017/hyperdx"
+            - name: OPAMP_PORT
+              value: "4320"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector-service:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "hdx-oss-app"
+            - name: USAGE_STATS_ENABLED
+              value: "true"
+            - name: CLICKHOUSE_HOST
+              value: "http://ch-server:8123"
+            - name: DEFAULT_CONNECTIONS
+              value: |
+                [
+                  {
+                    "id": "local-ch-id",
+                    "name": "Local ClickHouse",
+                    "host": "http://ch-server:8123",
+                    "port": 8123,
+                    "username": "app",
+                    "password": "hyperdx"
+                  }
+                ]
+            - name: DEFAULT_SOURCES
+              value: |
+                [
+                  {
+                    "from": { "databaseName": "default", "tableName": "otel_logs" },
+                    "kind": "log",
+                    "timestampValueExpression": "Timestamp",
+                    "name": "Logs",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "Body",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "Body",
+                    "eventAttributesExpression": "LogAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,SeverityText,Body",
+                    "severityTextExpression": "SeverityText",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "connection": "Local ClickHouse",
+                    "traceSourceId": "Traces",
+                    "sessionSourceId": "Sessions",
+                    "metricSourceId": "Metrics"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "otel_traces" },
+                    "kind": "trace",
+                    "timestampValueExpression": "Timestamp",
+                    "name": "Traces",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "SpanName",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "SpanName",
+                    "eventAttributesExpression": "SpanAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "durationExpression": "Duration",
+                    "durationPrecision": 9,
+                    "parentSpanIdExpression": "ParentSpanId",
+                    "spanNameExpression": "SpanName",
+                    "spanKindExpression": "SpanKind",
+                    "statusCodeExpression": "StatusCode",
+                    "statusMessageExpression": "StatusMessage",
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "sessionSourceId": "Sessions",
+                    "metricSourceId": "Metrics"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "" },
+                    "kind": "metric",
+                    "timestampValueExpression": "TimeUnix",
+                    "name": "Metrics",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "metricTables": {
+                      "gauge": "otel_metrics_gauge",
+                      "histogram": "otel_metrics_histogram",
+                      "sum": "otel_metrics_sum"
+                    },
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "traceSourceId": "Traces",
+                    "sessionSourceId": "Sessions"
+                  },
+                  {
+                    "from": { "databaseName": "default", "tableName": "hyperdx_sessions" },
+                    "kind": "session",
+                    "timestampValueExpression": "TimestampTime",
+                    "name": "Sessions",
+                    "displayedTimestampValueExpression": "Timestamp",
+                    "implicitColumnExpression": "Body",
+                    "serviceNameExpression": "ServiceName",
+                    "bodyExpression": "Body",
+                    "eventAttributesExpression": "LogAttributes",
+                    "resourceAttributesExpression": "ResourceAttributes",
+                    "defaultTableSelectExpression": "Timestamp,ServiceName,SeverityText,Body",
+                    "severityTextExpression": "SeverityText",
+                    "traceIdExpression": "TraceId",
+                    "spanIdExpression": "SpanId",
+                    "connection": "Local ClickHouse",
+                    "logSourceId": "Logs",
+                    "traceSourceId": "Traces",
+                    "metricSourceId": "Metrics"
+                  }
+                ]
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            periodSeconds: 30
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTP
+            initialDelaySeconds: 1
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+---
+# Port 80 -> targetPort 3000 (app) để URL public không cần hậu tố --<port>
+# theo đúng quy tắc wildcard bạn mô tả (mặc định proxy vào port 80):
+#   https://hyperdx-api.sandbox.kamimind.ai/
+# Port 8000 (api) và 4320 (opamp) chỉ dùng nội bộ cluster (SERVER_URL,
+# OPAMP_SERVER_URL của otel-collector) — không cần expose ra ngoài, nhưng vẫn
+# khai trong Service để DNS nội bộ hoạt động; nếu cần gọi API trực tiếp từ
+# ngoài, truy cập qua https://hyperdx-api--8000.sandbox.kamimind.ai/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperdx-api
+  namespace: sandbox
+spec:
+  selector:
+    app: hyperdx-api
+  ports:
+    - name: app
+      port: 80
+      targetPort: 3000
+    - name: api
+      port: 8000
+      targetPort: 8000
+    - name: opamp
+      port: 4320
+      targetPort: 4320
+---
+# Service RIÊNG chỉ để lấy đúng domain public bạn muốn:
+#   https://hyperdx.sandbox.kamimind.ai/
+# (vì wildcard proxy dùng đúng tên Service làm hostname, và Service
+# "hyperdx-api" đã tồn tại/đang dùng nội bộ nên không đổi tên được — Service
+# name trong Kubernetes là immutable, phải xoá mới đổi tên được, mà bạn không
+# có quyền delete).
+#
+# Đây là 1 Service MỚI, tên "hyperdx", cùng selector "app: hyperdx-api" nên
+# trỏ vào ĐÚNG pod hyperdx-api đang chạy — không đụng, không xoá, không sửa gì
+# Service/Deployment cũ. Chỉ cần bấm Create với file này.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperdx
+  namespace: sandbox
+spec:
+  selector:
+    app: hyperdx-api
+  ports:
+    - name: app
+      port: 80
+      targetPort: 3000

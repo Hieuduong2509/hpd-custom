@@ -1,0 +1,25 @@
+# Port 80 -> targetPort 3000 (app) để URL public không cần hậu tố --<port>
+# theo đúng quy tắc wildcard bạn mô tả (mặc định proxy vào port 80):
+#   https://hyperdx-api.sandbox.kamimind.ai/
+# Port 8000 (api) và 4320 (opamp) chỉ dùng nội bộ cluster (SERVER_URL,
+# OPAMP_SERVER_URL của otel-collector) — không cần expose ra ngoài, nhưng vẫn
+# khai trong Service để DNS nội bộ hoạt động; nếu cần gọi API trực tiếp từ
+# ngoài, truy cập qua https://hyperdx-api--8000.sandbox.kamimind.ai/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperdx-api
+  namespace: sandbox
+spec:
+  selector:
+    app: hyperdx-api
+  ports:
+    - name: app
+      port: 80
+      targetPort: 3000
+    - name: api
+      port: 8000
+      targetPort: 8000
+    - name: opamp
+      port: 4320
+      targetPort: 4320

@@ -1,0 +1,147 @@
+import {
+  Alert,
+  AlertsPageItem as _AlertsPageItem,
+  BuilderChartConfig,
+  Filter,
+  NumberFormat as _NumberFormat,
+} from '@hyperdx/common-utils/dist/types';
+
+export type NumberFormat = _NumberFormat;
+
+export type AlertsPageItem = _AlertsPageItem;
+
+export type AlertWithCreatedBy = Alert & {
+  createdBy?: {
+    email: string;
+    name?: string;
+  };
+};
+
+export type SearchConfig = {
+  select?: string | null;
+  source?: string | null;
+  where?: BuilderChartConfig['where'] | null;
+  whereLanguage?: BuilderChartConfig['whereLanguage'] | null;
+  filters?: Filter[] | null;
+  orderBy?: string | null;
+};
+
+export type StacktraceFrame = {
+  filename: string;
+  function: string;
+  module?: string;
+  lineno: number;
+  colno: number;
+  in_app: boolean;
+  context_line?: string;
+  pre_context?: string[];
+  post_context?: string[];
+};
+
+type StacktraceBreadcrumbCategory =
+  | 'ui.click'
+  | 'fetch'
+  | 'xhr'
+  | 'console'
+  | 'navigation'
+  | string;
+
+export type StacktraceBreadcrumb = {
+  type?: string;
+  level?: string;
+  event_id?: string;
+  category?: StacktraceBreadcrumbCategory;
+  message?: string;
+  data?: { [key: string]: any };
+  timestamp: number;
+};
+
+export type AggFn =
+  | 'avg_rate'
+  | 'avg'
+  | 'count_distinct'
+  | 'count'
+  | 'count_per_sec'
+  | 'count_per_min'
+  | 'count_per_hour'
+  | 'last_value'
+  | 'max_rate'
+  | 'max'
+  | 'min_rate'
+  | 'min'
+  | 'p50_rate'
+  | 'p50'
+  | 'p90_rate'
+  | 'p90'
+  | 'p95_rate'
+  | 'p95'
+  | 'p99_rate'
+  | 'p99'
+  | 'sum_rate'
+  | 'sum';
+
+type SourceTable = 'logs' | 'rrweb' | 'metrics';
+
+export enum MetricsDataType {
+  Gauge = 'Gauge',
+  Histogram = 'Histogram',
+  Sum = 'Sum',
+  Summary = 'Summary',
+}
+
+type SeriesDBDataSource = {
+  databaseName?: string;
+  tableName?: string;
+  timestampColumn?: string;
+};
+
+export type TimeChartSeries = {
+  displayName?: string;
+  table: SourceTable;
+  type: 'time';
+  aggFn?: AggFn; // TODO: Type
+  field?: string | undefined;
+  where: string;
+  groupBy: string[];
+  numberFormat?: NumberFormat;
+  color?: string;
+  displayType?: 'stacked_bar' | 'line';
+  implicitColumn?: string;
+  whereSql?: string;
+  groupBySql?: string;
+  fieldSql?: string;
+} & SeriesDBDataSource;
+
+export type TableChartSeries = {
+  visible?: boolean;
+  columnWidthPercent?: number;
+  displayName?: string;
+  type: 'table';
+  table: SourceTable;
+  aggFn?: AggFn;
+  field?: string | undefined;
+  where: string;
+  groupBy: string[];
+  sortOrder?: 'desc' | 'asc';
+  numberFormat?: NumberFormat;
+  color?: string;
+} & SeriesDBDataSource;
+
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/receiver/k8sclusterreceiver/documentation.md#k8spodphase
+export enum KubePhase {
+  Pending = 1,
+  Running = 2,
+  Succeeded = 3,
+  Failed = 4,
+  Unknown = 5,
+}
+
+export type NextApiConfigResponseData = {
+  apiKey?: string;
+  collectorUrl: string;
+  collectorTracesUrl?: string;
+  collectorMetricsUrl?: string;
+  collectorLogsUrl?: string;
+  serviceName: string;
+  appVersion?: string;
+};

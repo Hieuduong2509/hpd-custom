@@ -1,0 +1,245 @@
+# config.xml: dựa trên docker/clickhouse/local/config.xml trong repo, đã có
+# fix custom_settings_prefixes=custom,hyperdx (nếu không có dòng này, mọi
+# query sẽ báo lỗi "Setting custom_hdx_api_key is neither a builtin setting...").
+#
+# users.xml: thêm 2 user riêng theo đúng mẫu bạn thấy ở namespace logging
+# (app / otelcollector) thay vì dùng chung 1 user default cho mọi thứ — khớp
+# với username/password đã khai trong 10-hyperdx-api-deployment.yaml
+# (DEFAULT_CONNECTIONS) và 08-otel-collector-deployment.yaml (CLICKHOUSE_USER/
+# CLICKHOUSE_PASSWORD).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ch-server-config
+  namespace: sandbox
+data:
+  config.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <logger>
+            <level>debug</level>
+            <console>true</console>
+            <log remove="remove" />
+            <errorlog remove="remove" />
+        </logger>
+
+        <listen_host>0.0.0.0</listen_host>
+        <http_port>8123</http_port>
+        <tcp_port>9000</tcp_port>
+        <interserver_http_host>ch-server</interserver_http_host>
+        <interserver_http_port>9009</interserver_http_port>
+
+        <max_connections>4096</max_connections>
+        <keep_alive_timeout>64</keep_alive_timeout>
+        <max_concurrent_queries>100</max_concurrent_queries>
+        <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+        <mark_cache_size>5368709120</mark_cache_size>
+
+        <path>/var/lib/clickhouse/</path>
+        <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+        <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+
+        <user_directories>
+            <users_xml>
+                <path>users.xml</path>
+            </users_xml>
+        </user_directories>
+        <default_profile>default</default_profile>
+        <default_database>default</default_database>
+        <timezone>UTC</timezone>
+        <mlock_executable>false</mlock_executable>
+
+        <access_control_path>/var/lib/clickhouse/access</access_control_path>
+
+        <prometheus>
+            <port>9363</port>
+            <metrics>true</metrics>
+            <events>true</events>
+            <asynchronous_metrics>true</asynchronous_metrics>
+            <errors>true</errors>
+            <handlers>
+                <metrics_handler>
+                    <url>/metrics</url>
+                    <handler>
+                        <type>expose_metrics</type>
+                        <metrics>true</metrics>
+                        <asynchronous_metrics>true</asynchronous_metrics>
+                        <events>true</events>
+                        <errors>true</errors>
+                    </handler>
+                </metrics_handler>
+                <remote_write_handler>
+                    <url>/write</url>
+                    <handler>
+                        <type>remote_write</type>
+                        <database>default</database>
+                        <table>metrics_ts</table>
+                    </handler>
+                </remote_write_handler>
+                <remote_read_handler>
+                    <url>/read</url>
+                    <handler>
+                        <type>remote_read</type>
+                        <database>default</database>
+                        <table>metrics_ts</table>
+                    </handler>
+                </remote_read_handler>
+            </handlers>
+        </prometheus>
+
+        <query_log>
+            <database>system</database>
+            <table>query_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_log>
+
+        <metric_log>
+            <database>system</database>
+            <table>metric_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+        </metric_log>
+
+        <asynchronous_metric_log>
+            <database>system</database>
+            <table>asynchronous_metric_log</table>
+            <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+        </asynchronous_metric_log>
+
+        <opentelemetry_span_log>
+            <engine>
+                engine MergeTree
+                partition by toYYYYMM(finish_date)
+                order by (finish_date, finish_time_us, trace_id)
+            </engine>
+            <database>system</database>
+            <table>opentelemetry_span_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </opentelemetry_span_log>
+
+        <crash_log>
+            <database>system</database>
+            <table>crash_log</table>
+            <partition_by />
+            <flush_interval_milliseconds>1000</flush_interval_milliseconds>
+        </crash_log>
+
+        <processors_profile_log>
+            <database>system</database>
+            <table>processors_profile_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </processors_profile_log>
+
+        <part_log>
+            <database>system</database>
+            <table>part_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </part_log>
+
+        <trace_log>
+            <database>system</database>
+            <table>trace_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </trace_log>
+
+        <query_thread_log>
+            <database>system</database>
+            <table>query_thread_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_thread_log>
+
+        <query_views_log>
+            <database>system</database>
+            <table>query_views_log</table>
+            <partition_by>toYYYYMM(event_date)</partition_by>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        </query_views_log>
+
+        <remote_servers>
+            <hdx_cluster>
+                <shard>
+                    <replica>
+                        <host>ch-server</host>
+                        <port>9000</port>
+                    </replica>
+                </shard>
+            </hdx_cluster>
+        </remote_servers>
+
+        <distributed_ddl>
+            <path>/clickhouse/task_queue/ddl</path>
+        </distributed_ddl>
+
+        <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+
+        <custom_settings_prefixes>custom,hyperdx</custom_settings_prefixes>
+    </clickhouse>
+  users.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <profiles>
+            <default>
+                <max_memory_usage>10000000000</max_memory_usage>
+                <use_uncompressed_cache>0</use_uncompressed_cache>
+                <load_balancing>in_order</load_balancing>
+                <log_queries>1</log_queries>
+                <allow_experimental_time_series_table>1</allow_experimental_time_series_table>
+            </default>
+        </profiles>
+
+        <users>
+            <!-- Admin/bootstrap user. Empty password — only safe because the
+                 ch-server Service is ClusterIP-only (not exposed outside the
+                 cluster). Do not add an Ingress/NodePort to it. -->
+            <default>
+                <password></password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+                <access_management>1</access_management>
+            </default>
+            <!-- Used by the hyperdx-api app container (DEFAULT_CONNECTIONS). -->
+            <app>
+                <password>hyperdx</password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+            </app>
+            <!-- Used by the otel-collector container (CLICKHOUSE_USER/CLICKHOUSE_PASSWORD).
+                 access_management=1 required: the collector's startup seed script
+                 (00009_tenant_isolation_policies.sql) runs DROP/CREATE ROW POLICY,
+                 which needs the ACCESS MANAGEMENT privilege — without it ClickHouse
+                 rejects the query with "Not enough privileges ... grant DROP ROW
+                 POLICY ON default.otel_logs". -->
+            <otelcollector>
+                <password>otelcollectorpass</password>
+                <profile>default</profile>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <quota>default</quota>
+                <access_management>1</access_management>
+            </otelcollector>
+        </users>
+
+        <quotas>
+            <default>
+                <interval>
+                    <duration>3600</duration>
+                    <queries>0</queries>
+                    <errors>0</errors>
+                    <result_rows>0</result_rows>
+                    <read_rows>0</read_rows>
+                    <execution_time>0</execution_time>
+                </interval>
+            </default>
+        </quotas>
+    </clickhouse>

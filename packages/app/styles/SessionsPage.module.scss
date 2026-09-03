@@ -1,0 +1,22 @@
+.pageForm {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.toolbar {
+  flex: 1;
+  min-width: 0;
+}
+
+.sessionCard {
+  &:hover {
+    .emailText {
+      color: var(--color-text-brand);
+    }
+  }
+}
+
+.emailText {
+  transition: color 0.2s ease;
+}

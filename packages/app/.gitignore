@@ -1,0 +1,14 @@
+
+# Sentry
+.sentryclirc
+
+# Sentry
+next.config.original.js
+
+public/__ENV.js
+
+# Copied from CHANGELOG.md at build time (see next.config.mjs)
+public/CHANGELOG.md
+
+# E2E test authentication state
+tests/e2e/.auth/
