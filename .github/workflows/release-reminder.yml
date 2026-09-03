@@ -20,6 +20,7 @@ jobs:
         env:
           SLACK_WEBHOOK_OSS_PRS: ${{ secrets.SLACK_WEBHOOK_OSS_PRS }}
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const MENTION_ID = '${{ vars.RELEASE_SLACK_MEMBER_ID }}';
             const RELEASE_PR_TITLE = 'Release HyperDX';

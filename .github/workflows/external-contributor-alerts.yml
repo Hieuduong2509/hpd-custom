@@ -37,6 +37,7 @@ jobs:
         env:
           SLACK_WEBHOOK_OSS_PRS: ${{ secrets.SLACK_WEBHOOK_OSS_PRS }}
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const LABEL = 'external';
             const item = context.payload.issue ?? context.payload.pull_request;

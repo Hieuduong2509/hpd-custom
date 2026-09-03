@@ -219,6 +219,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v9
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           result-encoding: string
           script: |
             const fs = require('fs');
